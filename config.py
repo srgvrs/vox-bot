@@ -71,5 +71,18 @@ class Settings:
     # Estado animado de /video (formato <a:nombre:id> o vacío para spinner)
     status_emoji: str = os.getenv("STATUS_EMOJI", "")
 
+    # Modo automático de enlaces (desactivado por defecto)
+    auto_link_enabled: bool = os.getenv("AUTO_LINK_ENABLED", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    auto_link_channel_ids: tuple[int, ...] = tuple(
+        int(x)
+        for x in os.getenv("AUTO_LINK_CHANNEL_IDS", "").replace(" ", "").split(",")
+        if x.isdigit()
+    )
+
 
 settings = Settings()

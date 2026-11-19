@@ -10,12 +10,15 @@ from discord.ext import commands
 
 from config import settings
 
-COGS = ["cogs.imagenes", "cogs.video"]
+COGS = ["cogs.imagenes", "cogs.video", "cogs.enlaces"]
 
 
 class MediaBot(commands.Bot):
     def __init__(self) -> None:
-        super().__init__(command_prefix="!", intents=discord.Intents.default())
+        intents = discord.Intents.default()
+        if settings.auto_link_enabled:
+            intents.message_content = True
+        super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self) -> None:
         for cog in COGS:

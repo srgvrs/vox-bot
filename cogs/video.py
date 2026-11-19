@@ -3,6 +3,8 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
+from typing import Protocol
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -43,6 +45,298 @@ def _is_allowed(interaction: discord.Interaction) -> bool:
     return interaction.guild.id in settings.allowed_guild_ids
 
 
+def check_cooldown(user_id: int) -> int:
+    """Devuelve los segundos restantes de cooldown (0 si puede usar)."""
+    now = time.monotonic()
+    remaining = settings.video_cooldown_seconds - (now - _cooldowns[user_id])
+    if remaining > 0:
+        return int(remaining) + 1
+    _cooldowns[user_id] = now
+    return 0
+
+
+class Responder(Protocol):
+    """Abstracción de respuesta para reutilizar el flujo de /video."""
+
+    async def set_status(self, texto: str) -> None:
+        """Actualiza el mensaje de estado."""
+
+    async def send_result(
+        self,
+        result: DownloadResult,
+        recompressed: bool,
+        upload: UploadResult | None,
+    ) -> None:
+        """Envía el resultado final (adjunto o link)."""
+
+    async def send_error(self, mensaje: str) -> None:
+        """Envía un error al usuario."""
+
+
+class InteractionResponder:
+    """Responder basado en una interacción de slash command."""
+
+    def __init__(self, interaction: discord.Interaction) -> None:
+        self.interaction = interaction
+        self.status = StatusMessage(interaction)
+
+    async def set_status(self, texto: str) -> None:
+        await self.status.set(texto)
+
+    async def send_result(
+        self,
+        result: DownloadResult,
+        recompressed: bool,
+        upload: UploadResult | None,
+    ) -> None:
+        await self.status.stop()
+        if upload is None:
+            origen = "Adjunto (recomprimido)" if recompressed else "Adjunto"
+            embed = discord.Embed(title=(result.title or "Video")[:256])
+            if result.notice:
+                embed.description = result.notice
+            embed.set_footer(text=origen)
+            await self.interaction.edit_original_response(
+                content=None,
+                embed=embed,
+                attachments=[discord.File(result.path)],
+            )
+            return
+        origen = f"Subido a {upload.provider}"
+        size_mb = result.size / (1024 * 1024)
+        descripcion = "Toca el título para abrir el video"
+        if result.notice:
+            descripcion = f"{result.notice}\n{descripcion}"
+        embed = discord.Embed(
+            title=(result.title or "Video")[:256],
+            url=upload.url,
+            description=descripcion,
+        )
+        if result.thumbnail:
+            embed.set_image(url=result.thumbnail)
+        embed.set_footer(
+            text=f"{origen} (caduca en {upload.expiry_hours} h) · {size_mb:.1f} MB"
+        )
+        await self.interaction.edit_original_response(
+            content=None,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def send_error(self, mensaje: str) -> None:
+        await self.status.stop()
+        try:
+            await self.interaction.delete_original_response()
+        except (discord.HTTPException, discord.NotFound) as exc:
+            logger.debug("No se pudo borrar el mensaje de estado: %s", exc)
+        try:
+            await self.interaction.followup.send(mensaje, ephemeral=True)
+        except discord.HTTPException:
+            logger.exception("No se pudo enviar el mensaje de error")
+
+
+class MessageResponder:
+    """Responder basado en un mensaje (reply editado)."""
+
+    def __init__(self, message: discord.Message) -> None:
+        self.message = message
+        self.reply: discord.Message | None = None
+
+    async def _ensure_reply(self, content: str) -> discord.Message:
+        if self.reply is None:
+            self.reply = await self.message.reply(
+                content,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        return self.reply
+
+    async def set_status(self, texto: str) -> None:
+        reply = await self._ensure_reply(texto)
+        try:
+            await reply.edit(
+                content=texto,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException as exc:
+            logger.debug("No se pudo editar el estado del mensaje: %s", exc)
+
+    async def send_result(
+        self,
+        result: DownloadResult,
+        recompressed: bool,
+        upload: UploadResult | None,
+    ) -> None:
+        reply = await self._ensure_reply("Listo")
+        if upload is None:
+            origen = "Adjunto (recomprimido)" if recompressed else "Adjunto"
+            embed = discord.Embed(title=(result.title or "Video")[:256])
+            if result.notice:
+                embed.description = result.notice
+            embed.set_footer(text=origen)
+            await reply.edit(
+                content=None,
+                embed=embed,
+                attachments=[discord.File(result.path)],
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        origen = f"Subido a {upload.provider}"
+        size_mb = result.size / (1024 * 1024)
+        descripcion = "Toca el título para abrir el video"
+        if result.notice:
+            descripcion = f"{result.notice}\n{descripcion}"
+        embed = discord.Embed(
+            title=(result.title or "Video")[:256],
+            url=upload.url,
+            description=descripcion,
+        )
+        if result.thumbnail:
+            embed.set_image(url=result.thumbnail)
+        embed.set_footer(
+            text=f"{origen} (caduca en {upload.expiry_hours} h) · {size_mb:.1f} MB"
+        )
+        await reply.edit(
+            content=None,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def send_error(self, mensaje: str) -> None:
+        reply = await self._ensure_reply(mensaje)
+        try:
+            await reply.edit(
+                content=mensaje,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("No se pudo editar el mensaje de error")
+
+
+async def run_video_flow(
+    url: str,
+    user_id: int,
+    responder: Responder,
+    max_bytes: int,
+    origin: str,
+    channel_id: int | None = None,
+) -> None:
+    """Flujo reutilizable de /video: descarga, recompresión y envío."""
+    logger.info(
+        "Origen=%s usuario=%s canal=%s dominio=%s",
+        origin,
+        user_id,
+        channel_id,
+        urlparse(url).hostname,
+    )
+
+    result: DownloadResult | None = None
+    recompressed: DownloadResult | None = None
+    try:
+        result = await download_video(
+            url,
+            max_bytes=max_bytes,
+            on_status=responder.set_status,
+        )
+        logger.info(
+            "Descarga OK: %s (%d bytes, límite adjunto %d bytes)",
+            result.title,
+            result.size,
+            max_bytes,
+        )
+
+        # 1) Intentar adjunto directo.
+        if result.size <= max_bytes:
+            await responder.send_result(result, recompressed=False, upload=None)
+            return
+
+        # 2) Recomprimir una sola vez (si la duración lo permite).
+        duration_known = result.duration is not None and result.duration > 0
+        duration_min = (result.duration or 0) / 60
+        if duration_known and duration_min > settings.recompress_max_minutes:
+            logger.info(
+                "Se omite la recompresión: duración %.1f min > RECOMPRESS_MAX_MINUTES=%d",
+                duration_min,
+                settings.recompress_max_minutes,
+            )
+        elif ffmpeg_available() and duration_known:
+            try:
+                recompressed = await recompress_video(
+                    result,
+                    max_bytes,
+                    on_status=responder.set_status,
+                )
+                logger.info(
+                    "Recompresión OK: %d bytes (antes %d)",
+                    recompressed.size,
+                    result.size,
+                )
+                if recompressed.size <= max_bytes:
+                    await responder.send_result(
+                        recompressed, recompressed=True, upload=None
+                    )
+                    return
+            except RecompressError as exc:
+                logger.warning("Recompresión fallida: %s", exc)
+
+        # 3) Subida externa.
+        final = recompressed or result
+        if not _upload_limiter.is_allowed(user_id):
+            await responder.send_error(
+                "Alcanzaste el límite diario de subidas externas. Intenta de nuevo mañana."
+            )
+            return
+
+        await responder.set_status(
+            "El video es muy grande para Discord, se subirá a un host externo "
+            "(puede tardar un poco)...",
+        )
+        start = time.perf_counter()
+        try:
+            upload: UploadResult = await _storage_chain.upload(final.path)
+        except StorageError as exc:
+            logger.exception("Fallo de StorageChain")
+            await responder.send_error(f"No se pudo subir el video: {str(exc)[:300]}")
+            return
+
+        _upload_limiter.consume(user_id)
+        logger.info(
+            "Subida externa completada en %.2f s (%s)",
+            time.perf_counter() - start,
+            upload.provider,
+        )
+        await responder.send_result(final, recompressed=final is recompressed, upload=upload)
+
+    except VideoTooLongError as exc:
+        await responder.send_error(str(exc))
+    except VideoRestrictedError as exc:
+        await responder.send_error(str(exc))
+    except VideoUnsupportedError as exc:
+        await responder.send_error(str(exc))
+    except VideoNetworkError as exc:
+        await responder.send_error(str(exc))
+    except VideoLoginRequiredError as exc:
+        await responder.send_error(str(exc))
+    except VideoUnavailableError as exc:
+        await responder.send_error(str(exc))
+    except VideoError as exc:
+        await responder.send_error(str(exc))
+    except asyncio.TimeoutError:
+        logger.exception("Timeout en /video")
+        await responder.send_error(
+            "Se agotó el tiempo de espera al procesar el video."
+        )
+    except Exception as exc:
+        logger.exception("Error inesperado en /video")
+        await responder.send_error(
+            f"Error inesperado: {type(exc).__name__}: {str(exc)[:200]}"
+        )
+    finally:
+        for item in (result, recompressed):
+            if item is not None:
+                item.path.unlink(missing_ok=True)
+
+
 class Video(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -60,21 +354,17 @@ class Video(commands.Cog):
             )
             return
 
-        now = time.monotonic()
-        remaining = settings.video_cooldown_seconds - (
-            now - _cooldowns[interaction.user.id]
-        )
+        remaining = check_cooldown(interaction.user.id)
         if remaining > 0:
             await interaction.response.send_message(
-                f"Espera {int(remaining) + 1} s para usar /video de nuevo",
+                f"Espera {remaining} s para usar /video de nuevo",
                 ephemeral=True,
             )
             return
-        _cooldowns[interaction.user.id] = now
 
         await interaction.response.send_message("Buscando video...")
-        status = StatusMessage(interaction)
-        await status.set("Buscando video...")
+        responder = InteractionResponder(interaction)
+        await responder.set_status("Buscando video...")
 
         guild_limit = interaction.guild.filesize_limit if interaction.guild else 0
         config_limit = settings.upload_limit_mb * 1024 * 1024
@@ -86,224 +376,14 @@ class Video(commands.Cog):
             guild_limit,
         )
 
-        result: DownloadResult | None = None
-        recompressed: DownloadResult | None = None
-        try:
-            result = await download_video(
-                url,
-                max_bytes=max_bytes,
-                on_status=status.set,
-            )
-            logger.info(
-                "Descarga OK: %s (%d bytes, límite adjunto %d bytes)",
-                result.title,
-                result.size,
-                max_bytes,
-            )
-
-            # 1) Intentar adjunto directo.
-            if result.size <= max_bytes:
-                if await self._try_send_attachment(
-                    interaction, result, recompressed=False, status=status
-                ):
-                    return
-
-            # 2) Recomprimir una sola vez (si la duración lo permite).
-            #    Si la duración es desconocida, se saltan las reglas por duración
-            #    pero no se bloquea la recompresión cuando el archivo no cabe.
-            duration_known = result.duration is not None and result.duration > 0
-            duration_min = (result.duration or 0) / 60
-            if duration_known and duration_min > settings.recompress_max_minutes:
-                logger.info(
-                    "Se omite la recompresión: duración %.1f min > RECOMPRESS_MAX_MINUTES=%d",
-                    duration_min,
-                    settings.recompress_max_minutes,
-                )
-                # Si el archivo de HOST_VIDEO_HEIGHT cabe como adjunto, enviarlo.
-                if result.size <= max_bytes:
-                    if await self._try_send_attachment(
-                        interaction, result, recompressed=False, status=status
-                    ):
-                        return
-            elif ffmpeg_available() and duration_known:
-                try:
-                    recompressed = await recompress_video(
-                        result,
-                        max_bytes,
-                        on_status=status.set,
-                    )
-                    logger.info(
-                        "Recompresión OK: %d bytes (antes %d)",
-                        recompressed.size,
-                        result.size,
-                    )
-                    if recompressed.size <= max_bytes:
-                        if await self._try_send_attachment(
-                            interaction, recompressed, recompressed=True, status=status
-                        ):
-                            return
-                except RecompressError as exc:
-                    logger.warning("Recompresión fallida: %s", exc)
-
-            # 3) Subida externa.
-            await self._send_external(interaction, recompressed or result, status=status)
-
-        except VideoTooLongError as exc:
-            await status.stop()
-            await self._fail(interaction, str(exc))
-        except VideoRestrictedError as exc:
-            await status.stop()
-            await self._fail(interaction, str(exc))
-        except VideoUnsupportedError as exc:
-            await status.stop()
-            await self._fail(interaction, str(exc))
-        except VideoNetworkError as exc:
-            await status.stop()
-            await self._fail(interaction, str(exc))
-        except VideoLoginRequiredError as exc:
-            await status.stop()
-            await self._fail(interaction, str(exc))
-        except VideoUnavailableError as exc:
-            await status.stop()
-            await self._fail(interaction, str(exc))
-        except VideoError as exc:
-            await status.stop()
-            await self._fail(interaction, str(exc))
-        except asyncio.TimeoutError:
-            logger.exception("Timeout en /video")
-            await status.stop()
-            await self._fail(
-                interaction, "Se agotó el tiempo de espera al procesar el video."
-            )
-        except Exception as exc:
-            logger.exception("Error inesperado en /video")
-            await status.stop()
-            await self._fail(
-                interaction,
-                f"Error inesperado: {type(exc).__name__}: {str(exc)[:200]}",
-            )
-        finally:
-            await status.stop()
-            for item in (result, recompressed):
-                if item is not None:
-                    item.path.unlink(missing_ok=True)
-
-    async def _fail(self, interaction: discord.Interaction, mensaje: str) -> None:
-        """Borra el mensaje de estado y responde con un error ephemeral."""
-        try:
-            await interaction.delete_original_response()
-        except (discord.HTTPException, discord.NotFound) as exc:
-            logger.debug("No se pudo borrar el mensaje de estado: %s", exc)
-        try:
-            await interaction.followup.send(mensaje, ephemeral=True)
-        except discord.HTTPException:
-            logger.exception("No se pudo enviar el mensaje de error")
-
-    async def _try_send_attachment(
-        self,
-        interaction: discord.Interaction,
-        result: DownloadResult,
-        recompressed: bool,
-        status: StatusMessage,
-    ) -> bool:
-        """Intenta enviar como adjunto. Devuelve True si se envió."""
-        origen = "Adjunto (recomprimido)" if recompressed else "Adjunto"
-        embed = discord.Embed(title=(result.title or "Video")[:256])
-        if result.notice:
-            embed.description = result.notice
-        embed.set_footer(text=origen)
-        await status.set("Enviando...")
-        await status.stop()
-        start = time.perf_counter()
-        try:
-            await interaction.edit_original_response(
-                content=None,
-                embed=embed,
-                attachments=[discord.File(result.path)],
-            )
-            logger.info(
-                "Enviado como %s en %.2f s: %s",
-                origen,
-                time.perf_counter() - start,
-                result.title,
-            )
-            return True
-        except discord.HTTPException as exc:
-            if exc.status == 413 or getattr(exc, "code", None) == 40005:
-                logger.warning(
-                    "Discord rechazó el adjunto (413/40005); se intentará subida externa."
-                )
-                return False
-            logger.exception("HTTPException al enviar adjunto")
-            await self._fail(
-                interaction,
-                f"Discord rechazó el archivo: {exc.status} ({exc.text or 'sin detalle'})",
-            )
-            return True
-
-    async def _send_external(
-        self,
-        interaction: discord.Interaction,
-        result: DownloadResult,
-        status: StatusMessage,
-    ) -> None:
-        """Sube a un host externo y envía el enlace."""
-        if not _upload_limiter.is_allowed(interaction.user.id):
-            await status.stop()
-            await self._fail(
-                interaction,
-                "Alcanzaste el límite diario de subidas externas. Intenta de nuevo mañana.",
-            )
-            return
-
-        await status.set(
-            "El video es muy grande para Discord, se subirá a un host externo "
-            "(puede tardar un poco)...",
+        await run_video_flow(
+            url,
+            interaction.user.id,
+            responder,
+            max_bytes,
+            origin="slash",
+            channel_id=interaction.channel_id,
         )
-        start = time.perf_counter()
-        try:
-            upload: UploadResult = await _storage_chain.upload(result.path)
-        except StorageError as exc:
-            logger.exception("Fallo de StorageChain")
-            await status.stop()
-            await self._fail(
-                interaction, f"No se pudo subir el video: {str(exc)[:300]}"
-            )
-            return
-
-        _upload_limiter.consume(interaction.user.id)
-        logger.info(
-            "Subida externa completada en %.2f s (%s)",
-            time.perf_counter() - start,
-            upload.provider,
-        )
-
-        origen = f"Subido a {upload.provider}"
-        size_mb = result.size / (1024 * 1024)
-        descripcion = "Toca el título para abrir el video"
-        if result.notice:
-            descripcion = f"{result.notice}\n{descripcion}"
-        embed = discord.Embed(
-            title=(result.title or "Video")[:256],
-            url=upload.url,
-            description=descripcion,
-        )
-        if result.thumbnail:
-            embed.set_image(url=result.thumbnail)
-        embed.set_footer(
-            text=f"{origen} (caduca en {upload.expiry_hours} h) · {size_mb:.1f} MB"
-        )
-        await status.set("Enviando...")
-        await status.stop()
-        try:
-            await interaction.edit_original_response(
-                content=None,
-                embed=embed,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except (discord.HTTPException, discord.NotFound) as exc:
-            logger.warning("No se pudo editar el mensaje final: %s", exc)
-        logger.info("Enviado como %s: %s", origen, result.title)
 
 
 async def setup(bot: commands.Bot) -> None:
