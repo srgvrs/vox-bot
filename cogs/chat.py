@@ -236,6 +236,13 @@ class Chat(commands.Cog):
         _bump_daily()
         _prune_memories()
 
+        logger.info(
+            "Pregunta (mención) usuario=%s canal=%s: %s",
+            message.author.id,
+            message.channel.id,
+            text,
+        )
+
         memory = _get_memory(message.channel.id, message.author.id)
         messages = _build_messages(memory, text)
         try:
@@ -332,6 +339,13 @@ class Chat(commands.Cog):
         _last_ask[interaction.user.id] = time.monotonic()
         _bump_daily()
         _prune_memories()
+
+        logger.info(
+            "Pregunta (/preguntar) usuario=%s canal=%s: %s",
+            interaction.user.id,
+            interaction.channel_id,
+            texto,
+        )
 
         memory = _get_memory(interaction.channel_id, interaction.user.id)
         messages = _build_messages(memory, texto)
