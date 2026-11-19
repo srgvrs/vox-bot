@@ -57,5 +57,8 @@ class Settings:
     )
     serper_daily_limit: int = _int("SERPER_DAILY_LIMIT", 50)
 
+    # Estado animado de /video (formato <a:nombre:id> o vacío para spinner)
+    status_emoji: str = os.getenv("STATUS_EMOJI", "")
+
 
 settings = Settings()

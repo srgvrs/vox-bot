@@ -377,6 +377,8 @@ async def download_video(
     loop = asyncio.get_running_loop()
     async with _semaphore:
         try:
+            # yt-dlp y ffmpeg son bloqueantes: se ejecutan en un hilo para no
+            # congelar el event loop (y la animación del estado).
             path, title, duration, height, thumbnail = await asyncio.to_thread(
                 _download_sync, url, out_path, max_bytes, loop, on_status
             )
