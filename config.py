@@ -42,7 +42,12 @@ class Settings:
     recompress_timeout_s: int = _int("RECOMPRESS_TIMEOUT_S", 180)
     instagram_long_reel_seconds: int = _int("INSTAGRAM_LONG_REEL_SECONDS", 60)
     video_cooldown_seconds: int = _int("VIDEO_COOLDOWN_SECONDS", 30)
-    upload_limit_mb: int = _int("DISCORD_UPLOAD_LIMIT_MB", 20)
+    # None = no definido en .env (se usa el límite del servidor).
+    discord_upload_limit_mb: int | None = (
+        _int("DISCORD_UPLOAD_LIMIT_MB", 0) or None
+    )
+    # Valor efectivo si está definido, si no el default 20.
+    upload_limit_mb: int = discord_upload_limit_mb or 20
     max_concurrent_downloads: int = _int("MAX_CONCURRENT_DOWNLOADS", 2)
     max_uploads_per_user_day: int = _int("MAX_UPLOADS_PER_USER_DAY", 10)
     temp_dir: Path = Path(os.getenv("TEMP_DIR", "temp"))
