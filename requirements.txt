@@ -2,6 +2,6 @@ discord.py
 aiohttp
 certifi
 python-dotenv
-yt-dlp
+yt-dlp[default,curl-cffi]
 ddgs
 boto3

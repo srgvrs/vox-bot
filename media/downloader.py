@@ -16,6 +16,14 @@ import yt_dlp
 
 from config import settings
 
+try:
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+
+    _IMPERSONATE_AVAILABLE = True
+except Exception:  # pragma: no cover - depende de curl_cffi
+    ImpersonateTarget = None  # type: ignore[assignment]
+    _IMPERSONATE_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 _semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
@@ -239,22 +247,32 @@ def _pick_host_formats(
     return chosen, audio, _short_side(chosen) or 0, chosen_size
 
 
-_GENERIC_TITLES = {"", "instagram", "video", "reel", "post", "untitled"}
+_GENERIC_TITLES = {
+    "",
+    "instagram",
+    "video",
+    "reel",
+    "post",
+    "untitled",
+    "tiktok",
+    "x",
+    "twitter",
+}
 
 
 def _pick_title(info: dict, fallback_stem: str) -> str:
-    """Elige un título útil; para Instagram usa @uploader si falta."""
+    """Elige un título útil; usa @uploader si falta y recorta a 100 caracteres."""
     title = (info.get("title") or "").strip()
     if title and title.lower() not in _GENERIC_TITLES:
-        return title
+        return title[:100]
     uploader = (info.get("uploader") or info.get("uploader_id") or "").strip()
     if uploader:
         if not uploader.startswith("@"):
             uploader = "@" + uploader
-        return f"Video de {uploader}"
+        return f"Video de {uploader}"[:100]
     if "instagram.com" in (info.get("webpage_url") or ""):
         return "Video de Instagram"
-    return fallback_stem
+    return fallback_stem[:100]
 
 
 def _pick_instagram_short_side(
@@ -404,6 +422,14 @@ def _download_sync(
         "concurrent_fragment_downloads": 8,
         "logger": _YdlLogger(),
     }
+
+    host = (urlparse(url).hostname or "").lower()
+    if host == "tiktok.com" or host.endswith(".tiktok.com"):
+        if _IMPERSONATE_AVAILABLE and ImpersonateTarget is not None:
+            ydl_opts["impersonate"] = ImpersonateTarget("chrome")
+            logger.info("TikTok: usando impersonate=chrome (curl_cffi)")
+        else:
+            logger.warning("TikTok puede fallar sin curl_cffi")
 
     # 1) Comprobar duración antes de descargar.
     with yt_dlp.YoutubeDL({**ydl_opts, "skip_download": True}) as ydl:
@@ -579,9 +605,19 @@ class _YdlLogger:
         logger.error(msg)
 
 
-def _map_ytdlp_error(exc: yt_dlp.utils.DownloadError) -> VideoError:
+def _map_ytdlp_error(
+    exc: yt_dlp.utils.DownloadError, url: str | None = None
+) -> VideoError:
     """Traduce un DownloadError de yt-dlp a un error con mensaje claro."""
     msg = str(exc).lower()
+    host = (urlparse(url).hostname or "").lower() if url else ""
+    is_x = host == "x.com" or host.endswith(".x.com") or host == "twitter.com" or host.endswith(".twitter.com")
+    is_tiktok = host == "tiktok.com" or host.endswith(".tiktok.com")
+
+    if "403" in msg or "forbidden" in msg or "blocked" in msg or "captcha" in msg:
+        return VideoUnavailableError(
+            "El sitio bloqueó la descarga; intenta más tarde."
+        )
     if (
         "login" in msg
         or "log in" in msg
@@ -589,10 +625,23 @@ def _map_ytdlp_error(exc: yt_dlp.utils.DownloadError) -> VideoError:
         or "cookies" in msg
         or "rate-limit" in msg
         or "rate limit" in msg
+        or "sensitive" in msg
+        or "age-restricted" in msg
     ):
+        if is_x or is_tiktok:
+            return VideoLoginRequiredError(
+                "Requiere iniciar sesión; no se puede descargar."
+            )
         return VideoLoginRequiredError(
             "Instagram pide iniciar sesión para este contenido; no se puede descargar."
         )
+    if "no video" in msg or "no media" in msg or "no formats" in msg:
+        if is_x:
+            return VideoUnavailableError("Ese tweet no tiene video.")
+        if is_tiktok:
+            return VideoUnavailableError(
+                "Esa publicación no tiene video; puede ser de fotos."
+            )
     if "private" in msg or "unavailable" in msg or "not available" in msg:
         return VideoUnavailableError("El video es privado o no está disponible.")
     if "age" in msg and "restrict" in msg:
@@ -640,7 +689,7 @@ async def download_video(
         except VideoError:
             raise
         except yt_dlp.utils.DownloadError as exc:
-            raise _map_ytdlp_error(exc) from exc
+            raise _map_ytdlp_error(exc, url) from exc
     logger.info("Descarga completada en %.2f s", time.perf_counter() - start)
 
     size = path.stat().st_size

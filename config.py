@@ -57,7 +57,8 @@ class Settings:
     allowed_video_domains: tuple[str, ...] = tuple(
         x.strip().lower()
         for x in os.getenv(
-            "ALLOWED_VIDEO_DOMAINS", "youtube.com,youtu.be,instagram.com"
+            "ALLOWED_VIDEO_DOMAINS",
+            "youtube.com,youtu.be,instagram.com,x.com,twitter.com,tiktok.com",
         ).split(",")
         if x.strip()
     )
