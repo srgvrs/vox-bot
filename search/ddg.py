@@ -15,7 +15,10 @@ class DuckDuckGoProvider(SearchProvider):
 
     async def search(self, query: str, limit: int = 30) -> list[ImageResult]:
         """Busca imágenes en DuckDuckGo. Lanza excepción si el proveedor falla."""
-        raw = await asyncio.to_thread(self._search_sync, query, limit)
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(self._search_sync, query, limit),
+            timeout=20,
+        )
         return [self._to_result(item) for item in raw]
 
     @staticmethod

@@ -1,4 +1,5 @@
 """Configuración centralizada. Lee variables de entorno (.env)."""
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -6,6 +7,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 def _int(name: str, default: int) -> int:
@@ -91,3 +94,10 @@ class Settings:
 
 
 settings = Settings()
+
+logger.info(
+    "Config cargada: admin_user_ids=%s, allowed_guild_ids=%s, upload_limit_mb=%d",
+    settings.admin_user_ids,
+    settings.allowed_guild_ids,
+    settings.upload_limit_mb,
+)

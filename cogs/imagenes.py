@@ -1,4 +1,5 @@
 """Cog de búsqueda de imágenes: /img (embed paginado + botones)."""
+import asyncio
 import logging
 import random
 from urllib.parse import urlparse
@@ -179,13 +180,24 @@ class Imagenes(commands.Cog):
 
     @app_commands.command(name="img", description="Busca imágenes")
     async def img(self, interaction: discord.Interaction, consulta: str) -> None:
-        if not _is_allowed(interaction):
-            await interaction.response.send_message(
-                "Este bot solo funciona en servidores autorizados.",
-                ephemeral=True,
-            )
+        try:
+            if not _is_allowed(interaction):
+                await interaction.response.send_message(
+                    "Este bot solo funciona en servidores autorizados.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.defer()
+        except Exception:
+            logger.exception("Error en /img antes de responder")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "Error interno al procesar el comando.", ephemeral=True
+                    )
+            except Exception:
+                logger.exception("No se pudo enviar el mensaje de error")
             return
-        await interaction.response.defer()
 
         cache_key = normalize_query(consulta)
         cached = self.cache.get(cache_key)
@@ -193,10 +205,23 @@ class Imagenes(commands.Cog):
             results, provider_name = cached
         else:
             try:
-                results, provider_name = await self.chain.search(consulta, limit=100)
+                results, provider_name = await asyncio.wait_for(
+                    self.chain.search(consulta, limit=100),
+                    timeout=30,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Búsqueda de imágenes agotó el tiempo para %r", consulta)
+                await interaction.followup.send(
+                    "La búsqueda tardó demasiado. Intenta de nuevo en un momento.",
+                    ephemeral=True,
+                )
+                return
             except Exception as exc:
                 logger.exception("Fallo la búsqueda de imágenes para %r", consulta)
-                await report_error("img", exc)
+                try:
+                    await asyncio.wait_for(report_error("img", exc), timeout=5)
+                except Exception:
+                    logger.exception("No se pudo reportar el error")
                 await interaction.followup.send(
                     "No pude completar la búsqueda de imágenes. Intenta de nuevo en un momento.",
                     ephemeral=True,
@@ -211,11 +236,21 @@ class Imagenes(commands.Cog):
             )
             return
 
-        assert self.session is not None
+        if self.session is None:
+            logger.error("Sesión aiohttp no inicializada en /img")
+            await interaction.followup.send(
+                "El bot no está listo todavía. Intenta de nuevo en unos segundos.",
+                ephemeral=True,
+            )
+            return
         view = ImagePaginator(
             self.session, results, consulta, interaction.user.id, provider_name
         )
-        found = await view._find_valid(0)
+        try:
+            found = await asyncio.wait_for(view._find_valid(0), timeout=15)
+        except asyncio.TimeoutError:
+            logger.warning("Validación de imágenes agotó el tiempo para %r", consulta)
+            found = None
         if found is None:
             view.index = 0
             embed = view._build_embed(None)

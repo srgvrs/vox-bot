@@ -18,7 +18,13 @@ _START_TIME = time.monotonic()
 
 
 def _is_admin(user_id: int) -> bool:
-    return user_id in settings.admin_user_ids
+    allowed = settings.admin_user_ids
+    logger.debug(
+        "Comprobando admin: user_id=%s, admin_user_ids=%s",
+        user_id,
+        allowed,
+    )
+    return user_id in allowed
 
 
 def _dir_size(path: Path) -> int:
@@ -65,13 +71,24 @@ class Admin(commands.Cog):
 
     @app_commands.command(name="estado", description="Estado del bot (solo admins)")
     async def estado(self, interaction: discord.Interaction) -> None:
-        if not _is_admin(interaction.user.id):
-            await interaction.response.send_message(
-                "No tienes permiso para usar este comando.", ephemeral=True
-            )
-            return
+        try:
+            if not _is_admin(interaction.user.id):
+                await interaction.response.send_message(
+                    "No tienes permiso para usar este comando.", ephemeral=True
+                )
+                return
 
-        await interaction.response.defer(ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            logger.exception("Error en /estado antes de responder")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "Error interno al procesar el comando.", ephemeral=True
+                    )
+            except Exception:
+                logger.exception("No se pudo enviar el mensaje de error")
+            return
 
         try:
             import yt_dlp

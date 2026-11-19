@@ -421,7 +421,11 @@ class Video(commands.Cog):
 
         guild_limit = interaction.guild.filesize_limit if interaction.guild else 0
         config_limit = settings.upload_limit_mb * 1024 * 1024
-        max_bytes = min(guild_limit, config_limit) if guild_limit else config_limit
+        # Discord expone el límite real del servidor (10/25/50/100 MB según boosts).
+        # Si el guild reporta un límite mayor que el configurado, se usa el del guild.
+        # Si el config es mayor (servidor boosteado con filesize_limit desactualizado),
+        # se usa el config para no subir innecesariamente a un host externo.
+        max_bytes = max(guild_limit, config_limit) if guild_limit else config_limit
         logger.info(
             "Límite de adjunto: %d bytes (env=%d MB, guild.filesize_limit=%d bytes)",
             max_bytes,

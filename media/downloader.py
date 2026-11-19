@@ -127,7 +127,10 @@ def _build_format(height: int | None = None) -> str:
     height = height or settings.max_video_height
     return (
         f"bv*[height<={height}][vcodec^=avc1]+ba[acodec^=mp4a]"
-        f"/b[height<={height}]/b"
+        f"/bv*[height<={height}]+ba"
+        f"/b[height<={height}]"
+        f"/bv*+ba"
+        f"/b"
     )
 
 
@@ -136,6 +139,9 @@ def _build_small_format(max_bytes: int) -> str:
     return (
         f"bv*[height<=480][filesize_approx<{max_bytes}]+ba"
         f"/b[height<=480][filesize_approx<{max_bytes}]"
+        f"/bv*[height<=480]+ba"
+        f"/b[height<=480]"
+        f"/b"
     )
 
 
@@ -143,7 +149,10 @@ def _build_short_side_format(short_side: int) -> str:
     """Formato limitado por el lado corto (para verticales de Instagram)."""
     return (
         f"bv*[height<={short_side}][vcodec^=avc1]+ba[acodec^=mp4a]"
-        f"/b[height<={short_side}]/b"
+        f"/bv*[height<={short_side}]+ba"
+        f"/b[height<={short_side}]"
+        f"/bv*+ba"
+        f"/b"
     )
 
 
@@ -614,6 +623,10 @@ def _map_ytdlp_error(
     is_x = host == "x.com" or host.endswith(".x.com") or host == "twitter.com" or host.endswith(".twitter.com")
     is_tiktok = host == "tiktok.com" or host.endswith(".tiktok.com")
 
+    if "timed out" in msg or "timeout" in msg:
+        return VideoNetworkError(
+            "El origen del video tardó demasiado en responder; intenta de nuevo."
+        )
     if "403" in msg or "forbidden" in msg or "blocked" in msg or "captcha" in msg:
         return VideoUnavailableError(
             "El sitio bloqueó la descarga; intenta más tarde."
@@ -634,6 +647,10 @@ def _map_ytdlp_error(
             )
         return VideoLoginRequiredError(
             "Instagram pide iniciar sesión para este contenido; no se puede descargar."
+        )
+    if "requested format is not available" in msg:
+        return VideoUnavailableError(
+            "El formato del video no está disponible; intenta de nuevo."
         )
     if "no video" in msg or "no media" in msg or "no formats" in msg:
         if is_x:
