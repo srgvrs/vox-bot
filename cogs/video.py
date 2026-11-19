@@ -105,10 +105,9 @@ class InteractionResponder:
             if result.notice:
                 embed.description = result.notice
             embed.set_footer(text=origen)
-            await self.interaction.edit_original_response(
-                content=None,
+            await self._publish(
                 embed=embed,
-                attachments=[discord.File(result.path)],
+                file=discord.File(result.path),
             )
             return
         origen = f"Subido a {upload.provider}"
@@ -126,11 +125,58 @@ class InteractionResponder:
         embed.set_footer(
             text=f"{origen} (caduca en {upload.expiry_hours} h) · {size_mb:.1f} MB"
         )
-        await self.interaction.edit_original_response(
-            content=None,
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        await self._publish(embed=embed)
+
+    async def _publish(
+        self,
+        embed: discord.Embed,
+        file: discord.File | None = None,
+    ) -> None:
+        """Publica el resultado como mensaje nuevo; si falla, edita el original."""
+        channel = self.interaction.channel
+        if channel is not None:
+            try:
+                await channel.send(
+                    embed=embed,
+                    file=file,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                logger.info("Resultado /video publicado como mensaje nuevo")
+                try:
+                    await self.interaction.delete_original_response()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                    logger.debug(
+                        "No se pudo borrar el mensaje de progreso: %s", exc
+                    )
+                return
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning(
+                    "channel.send falló (%s); se usa edición de respaldo", exc
+                )
+                # El File ya pudo consumirse; se recrea desde la ruta si aplica.
+                if file is not None:
+                    file = discord.File(file.fp.name)  # type: ignore[union-attr]
+        logger.info("Resultado /video publicado por edición de respaldo")
+        try:
+            await self.interaction.edit_original_response(
+                content=None,
+                embed=embed,
+                attachments=[file] if file is not None else [],
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("No se pudo editar el mensaje de progreso (respaldo)")
+            if file is not None:
+                await self.interaction.followup.send(
+                    embed=embed,
+                    file=file,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                await self.interaction.followup.send(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
 
     async def send_error(self, mensaje: str) -> None:
         await self.status.stop()
@@ -221,11 +267,10 @@ class MessageResponder:
             if self.delete_original:
                 footer = f"{origen} · {self.author_label}"
             embed.set_footer(text=footer)
-            await reply.edit(
-                content=None,
+            await self._publish(
+                reply=reply,
                 embed=embed,
-                attachments=[discord.File(result.path)],
-                allowed_mentions=discord.AllowedMentions.none(),
+                file=discord.File(result.path),
             )
             await self._delete_original()
             return
@@ -245,12 +290,45 @@ class MessageResponder:
         if self.delete_original:
             footer = f"{footer} · {self.author_label}"
         embed.set_footer(text=footer)
+        await self._publish(reply=reply, embed=embed)
+        await self._delete_original()
+
+    async def _publish(
+        self,
+        reply: discord.Message,
+        embed: discord.Embed,
+        file: discord.File | None = None,
+    ) -> None:
+        """Publica el resultado como mensaje nuevo; si falla, edita el progreso."""
+        try:
+            await self.message.channel.send(
+                embed=embed,
+                file=file,
+                reference=self.message.to_reference(fail_if_not_exists=False),
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            logger.info("Resultado de enlaces publicado como mensaje nuevo")
+            try:
+                await reply.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                logger.debug(
+                    "No se pudo borrar el mensaje de progreso: %s", exc
+                )
+            return
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning(
+                "channel.send falló (%s); se usa edición de respaldo", exc
+            )
+            if file is not None:
+                file = discord.File(file.fp.name)  # type: ignore[union-attr]
+        logger.info("Resultado de enlaces publicado por edición de respaldo")
         await reply.edit(
             content=None,
             embed=embed,
+            attachments=[file] if file is not None else [],
             allowed_mentions=discord.AllowedMentions.none(),
         )
-        await self._delete_original()
 
     async def send_error(self, mensaje: str) -> None:
         reply = await self._ensure_reply(mensaje)
