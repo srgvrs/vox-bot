@@ -22,7 +22,17 @@ class MediaBot(commands.Bot):
             for guild_id in settings.allowed_guild_ids:
                 guild = discord.Object(id=guild_id)
                 self.tree.copy_global_to(guild=guild)
-                await self.tree.sync(guild=guild)
+                try:
+                    await self.tree.sync(guild=guild)
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    logging.error(
+                        "No se pudieron sincronizar los comandos en el servidor %s: %s. "
+                        "Causa probable: ID de servidor incorrecto o el bot no fue invitado "
+                        "con el scope 'applications.commands'. Se continúa con el siguiente servidor.",
+                        guild_id,
+                        exc,
+                    )
+                    continue
                 logging.info("Comandos sincronizados en guild %s", guild_id)
         else:
             await self.tree.sync()
