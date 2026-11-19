@@ -104,6 +104,17 @@ def _is_safe_url(url: str) -> bool:
     return True
 
 
+def _short_side(fmt: dict) -> int | None:
+    """Lado corto del formato (min(width, height)); en vertical height es el largo."""
+    w = fmt.get("width")
+    h = fmt.get("height")
+    if isinstance(w, int) and w > 0 and isinstance(h, int) and h > 0:
+        return min(w, h)
+    if isinstance(h, int) and h > 0:
+        return h
+    return None
+
+
 def _build_format(height: int | None = None) -> str:
     height = height or settings.max_video_height
     return (
@@ -117,6 +128,14 @@ def _build_small_format(max_bytes: int) -> str:
     return (
         f"bv*[height<=480][filesize_approx<{max_bytes}]+ba"
         f"/b[height<=480][filesize_approx<{max_bytes}]"
+    )
+
+
+def _build_short_side_format(short_side: int) -> str:
+    """Formato limitado por el lado corto (para verticales de Instagram)."""
+    return (
+        f"bv*[height<={short_side}][vcodec^=avc1]+ba[acodec^=mp4a]"
+        f"/b[height<={short_side}]/b"
     )
 
 
@@ -146,9 +165,8 @@ def _pick_host_formats(
         f
         for f in formats
         if f.get("vcodec") not in (None, "none")
-        and isinstance(f.get("height"), int)
-        and f["height"] > 0
-        and f["height"] <= settings.host_video_height
+        and _short_side(f) is not None
+        and _short_side(f) <= settings.host_video_height
     ]
     audios = [
         f
@@ -187,10 +205,10 @@ def _pick_host_formats(
     audio = min(audio_candidates, key=_audio_size) if audio_candidates else None
     audio_size = _audio_size(audio) if audio else 0
 
-    # Preferir códec avc1 si existe, luego ordenar por altura descendente.
+    # Preferir códec avc1 si existe, luego ordenar por lado corto descendente.
     def _video_key(f: dict) -> tuple[int, int]:
         is_avc = 1 if str(f.get("vcodec", "")).startswith("avc1") else 0
-        return (is_avc, f["height"])
+        return (is_avc, _short_side(f) or 0)
 
     videos_sorted = sorted(videos, key=_video_key, reverse=True)
 
@@ -207,18 +225,18 @@ def _pick_host_formats(
             break
 
     if chosen is None:
-        # Ninguno cabe: usar el de menor altura disponible.
-        chosen = min(videos, key=lambda f: f["height"])
+        # Ninguno cabe: usar el de menor lado corto disponible.
+        chosen = min(videos, key=lambda f: _short_side(f) or 0)
         v_size = _estimate_size(chosen, duration) or 0
         chosen_size = int((v_size + audio_size) * 1.05)
         logger.warning(
-            "Ningún formato cabe en HOST_MAX_MB=%d; se usa el de menor altura (%dp, ~%d bytes)",
+            "Ningún formato cabe en HOST_MAX_MB=%d; se usa el de menor lado corto (%dp, ~%d bytes)",
             settings.host_max_mb,
-            chosen["height"],
+            _short_side(chosen) or 0,
             chosen_size,
         )
 
-    return chosen, audio, chosen["height"], chosen_size
+    return chosen, audio, _short_side(chosen) or 0, chosen_size
 
 
 _GENERIC_TITLES = {"", "instagram", "video", "reel", "post", "untitled"}
@@ -237,6 +255,65 @@ def _pick_title(info: dict, fallback_stem: str) -> str:
     if "instagram.com" in (info.get("webpage_url") or ""):
         return "Video de Instagram"
     return fallback_stem
+
+
+def _pick_instagram_short_side(
+    info: dict, duration: float | None, max_bytes: int
+) -> tuple[dict, dict | None, int, int] | None:
+    """Elige formato para un reel largo de Instagram limitando el lado corto a 480.
+
+    Devuelve (video, audio, lado_corto, tamaño_estimado) o None si no hay formatos.
+    """
+    formats = info.get("formats") or []
+    videos = [
+        f
+        for f in formats
+        if f.get("vcodec") not in (None, "none")
+        and _short_side(f) is not None
+        and _short_side(f) <= 480
+    ]
+    if not videos:
+        return None
+    audios = [
+        f
+        for f in formats
+        if f.get("acodec") not in (None, "none")
+        and f.get("vcodec") in (None, "none")
+    ]
+
+    def _audio_size(f: dict) -> int:
+        return _estimate_size(f, duration) or 0
+
+    audio_candidates = [
+        f for f in audios if isinstance(f.get("abr"), (int, float)) and f["abr"] >= 96
+    ]
+    if not audio_candidates:
+        audio_candidates = audios
+    audio = min(audio_candidates, key=_audio_size) if audio_candidates else None
+    audio_size = _audio_size(audio) if audio else 0
+
+    def _video_key(f: dict) -> tuple[int, int]:
+        is_avc = 1 if str(f.get("vcodec", "")).startswith("avc1") else 0
+        return (is_avc, _short_side(f) or 0)
+
+    videos_sorted = sorted(videos, key=_video_key, reverse=True)
+    chosen: dict | None = None
+    chosen_size = 0
+    for f in videos_sorted:
+        v_size = _estimate_size(f, duration)
+        if v_size is None:
+            continue
+        total = int((v_size + audio_size) * 1.05)
+        if total <= max_bytes:
+            chosen = f
+            chosen_size = total
+            break
+    if chosen is None:
+        chosen = min(videos, key=lambda f: _short_side(f) or 0)
+        v_size = _estimate_size(chosen, duration) or 0
+        chosen_size = int((v_size + audio_size) * 1.05)
+
+    return chosen, audio, _short_side(chosen) or 0, chosen_size
 
 
 def _normalize_thumbnail(url: str | None) -> str | None:
@@ -314,6 +391,21 @@ def _download_sync(
             f"El video dura más de {settings.max_video_minutes} minutos."
         )
 
+    webpage = (info.get("webpage_url") or url or "").lower()
+    is_instagram = "instagram.com" in webpage
+    is_long_instagram = (
+        is_instagram
+        and duration is not None
+        and duration > settings.instagram_long_reel_seconds
+    )
+    logger.info(
+        "Dominio=%s duración=%.1fs instagram=%s long_reel=%s",
+        urlparse(url).hostname,
+        duration or 0.0,
+        is_instagram,
+        is_long_instagram,
+    )
+
     # 2) Intentar un formato que ya quepa en max_bytes (evita recomprimir).
     if max_bytes:
         small_opts = {**ydl_opts, "format": _build_small_format(max_bytes)}
@@ -334,9 +426,32 @@ def _download_sync(
 
     # 3) Elegir altura según destino: si va a host externo (duración > límite de
     #    recompresión), usar HOST_VIDEO_HEIGHT con tope HOST_MAX_MB; si no,
-    #    MAX_VIDEO_HEIGHT.
+    #    MAX_VIDEO_HEIGHT. Los reels largos de Instagram se limitan a 480p
+    #    (lado corto) para intentar que quepan como adjunto sin recomprimir.
     duration_min = (duration or 0) / 60
-    if duration_min > settings.recompress_max_minutes:
+    if is_long_instagram:
+        picked_ig = _pick_instagram_short_side(info, duration, max_bytes or 0)
+        if picked_ig is not None:
+            video_fmt, audio_fmt, short_side, est_size = picked_ig
+            logger.info(
+                "Instagram reel largo: lado corto=%dp, tamaño estimado ~%d bytes "
+                "(límite adjunto %d bytes)",
+                short_side,
+                est_size,
+                max_bytes or 0,
+            )
+            if audio_fmt is not None:
+                fmt = f"{video_fmt['format_id']}+{audio_fmt['format_id']}"
+            else:
+                fmt = video_fmt["format_id"]
+            height = short_side
+        else:
+            height = 480
+            logger.info(
+                "Instagram reel largo sin formatos con lado corto; se usa %dp", height
+            )
+            fmt = _build_short_side_format(height)
+    elif duration_min > settings.recompress_max_minutes:
         host_max_bytes = settings.host_max_mb * 1024 * 1024
         picked = _pick_host_formats(info, duration, host_max_bytes)
         if picked is None:
@@ -380,7 +495,11 @@ def _download_sync(
         raise VideoUnavailableError("No se pudo descargar el video.")
     final_path = candidates[0]
     logger.info(
-        "Tamaño real final: %d bytes (altura %dp)", final_path.stat().st_size, height
+        "Tamaño real final: %d bytes (lado corto %dp, dominio=%s, duración=%.1fs)",
+        final_path.stat().st_size,
+        height,
+        urlparse(url).hostname,
+        duration or 0.0,
     )
     return final_path, title, duration, height, thumbnail, notice
 
