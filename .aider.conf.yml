@@ -1,0 +1,8 @@
+# Archivos de solo lectura que Aider carga siempre
+read:
+  - CONVENTIONS.md
+
+# Opcional: modo architect con DeepSeek (verifica los nombres con `aider --help`)
+# architect: true
+# model: deepseek/deepseek-reasoner
+# editor-model: deepseek/deepseek-chat

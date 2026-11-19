@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+temp/*
+!temp/.gitkeep
+.aider*
+!.aider.conf.yml
+
+# Código de terceros: no se versiona (revisa su licencia antes de copiar)
+referencias/
