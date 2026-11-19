@@ -21,6 +21,15 @@ logger = logging.getLogger(__name__)
 _MAX_SKIP_ATTEMPTS = 5
 
 
+def _is_allowed(interaction: discord.Interaction) -> bool:
+    """Permite solo en guilds autorizados; rechaza DMs."""
+    if interaction.guild is None:
+        return False
+    if not settings.allowed_guild_ids:
+        return True
+    return interaction.guild.id in settings.allowed_guild_ids
+
+
 class PageModal(discord.ui.Modal, title="Ir a página"):
     numero: discord.ui.TextInput = discord.ui.TextInput(
         label="Número de página",
@@ -169,6 +178,12 @@ class Imagenes(commands.Cog):
 
     @app_commands.command(name="img", description="Busca imágenes")
     async def img(self, interaction: discord.Interaction, consulta: str) -> None:
+        if not _is_allowed(interaction):
+            await interaction.response.send_message(
+                "Este bot solo funciona en servidores autorizados.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.defer()
 
         cache_key = normalize_query(consulta)

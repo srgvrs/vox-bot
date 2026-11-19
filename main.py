@@ -17,7 +17,25 @@ class MediaBot(commands.Bot):
     async def setup_hook(self) -> None:
         for cog in COGS:
             await self.load_extension(cog)
-        await self.tree.sync()
+        self.tree.copy_global_to(guild=discord.Object(id=0)) if False else None
+        if settings.allowed_guild_ids:
+            for guild_id in settings.allowed_guild_ids:
+                guild = discord.Object(id=guild_id)
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                logging.info("Comandos sincronizados en guild %s", guild_id)
+        else:
+            await self.tree.sync()
+            logging.info("Comandos sincronizados globalmente (sin ALLOWED_GUILD_IDS)")
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        if settings.allowed_guild_ids and guild.id not in settings.allowed_guild_ids:
+            logging.warning(
+                "Guild no permitido %s (%s); saliendo.", guild.id, guild.name
+            )
+            await guild.leave()
+        else:
+            logging.info("Unido a guild permitido %s (%s)", guild.id, guild.name)
 
 
 async def main() -> None:

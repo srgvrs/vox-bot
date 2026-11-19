@@ -1,13 +1,16 @@
 """Prueba los proveedores en orden con circuit breaker simple."""
 import logging
 import time
+from datetime import datetime, timezone
 
+from config import settings
 from search.base import ImageResult, SearchProvider
 
 logger = logging.getLogger(__name__)
 
 _FAILURE_THRESHOLD = 3
 _COOLDOWN_SECONDS = 5 * 60
+_DAILY_LIMITED_PROVIDERS = {"serper"}
 
 
 class SearchChain:
@@ -15,6 +18,28 @@ class SearchChain:
         self.providers = providers
         self._failures: dict[str, int] = {}
         self._skip_until: dict[str, float] = {}
+        self._daily_count: dict[str, int] = {}
+        self._daily_reset_day: str = self._today()
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.now(timezone.utc).date().isoformat()
+
+    def _roll_daily_if_needed(self) -> None:
+        today = self._today()
+        if today != self._daily_reset_day:
+            self._daily_count.clear()
+            self._daily_reset_day = today
+
+    def _is_daily_exhausted(self, name: str) -> bool:
+        if name not in _DAILY_LIMITED_PROVIDERS:
+            return False
+        self._roll_daily_if_needed()
+        return self._daily_count.get(name, 0) >= settings.serper_daily_limit
+
+    def _bump_daily(self, name: str) -> None:
+        if name in _DAILY_LIMITED_PROVIDERS:
+            self._daily_count[name] = self._daily_count.get(name, 0) + 1
 
     def _is_skipped(self, name: str) -> bool:
         until = self._skip_until.get(name, 0.0)
@@ -44,6 +69,14 @@ class SearchChain:
             if self._is_skipped(provider.name):
                 logger.info("Proveedor %s en cooldown, se omite", provider.name)
                 continue
+            if self._is_daily_exhausted(provider.name):
+                logger.info(
+                    "Proveedor %s alcanzó el límite diario (%d), se omite",
+                    provider.name,
+                    settings.serper_daily_limit,
+                )
+                continue
+            self._bump_daily(provider.name)
             try:
                 results = await provider.search(query, limit=limit)
             except Exception as exc:
