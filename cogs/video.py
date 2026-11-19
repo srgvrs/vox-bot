@@ -200,13 +200,19 @@ class Video(commands.Cog):
         )
 
         origen = f"Subido a {upload.provider}"
-        content = (
-            f"**{(result.title or 'Video')[:256]}**\n"
-            f"{upload.url}\n"
-            f"-# {origen} (el enlace caduca en {upload.expiry_hours} h)"
+        size_mb = result.size / (1024 * 1024)
+        embed = discord.Embed(
+            title=(result.title or "Video")[:256],
+            url=upload.url,
+            description="Toca el título para abrir el video",
+        )
+        if result.thumbnail:
+            embed.set_image(url=result.thumbnail)
+        embed.set_footer(
+            text=f"{origen} (caduca en {upload.expiry_hours} h) · {size_mb:.1f} MB"
         )
         await interaction.followup.send(
-            content=content,
+            embed=embed,
             allowed_mentions=discord.AllowedMentions.none(),
         )
         logger.info("Enviado como %s: %s", origen, result.title)

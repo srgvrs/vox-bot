@@ -59,6 +59,7 @@ class DownloadResult:
     duration: float | None
     size: int
     height: int | None = None
+    thumbnail: str | None = None
 
 
 def _is_safe_url(url: str) -> bool:
@@ -187,12 +188,22 @@ def _pick_host_formats(
     return chosen, audio, chosen["height"], chosen_size
 
 
+def _normalize_thumbnail(url: str | None) -> str | None:
+    """Normaliza la miniatura: YouTube .webp -> .jpg."""
+    if not url:
+        return None
+    if "ytimg.com" in url or "youtube.com" in url or "youtu.be" in url:
+        if url.endswith(".webp"):
+            return url[:-5] + ".jpg"
+    return url
+
+
 def _download_sync(
     url: str, out_path: Path, max_bytes: int | None = None
-) -> tuple[Path, str, float | None, int]:
+) -> tuple[Path, str, float | None, int, str | None]:
     """Descarga bloqueante (se ejecuta en un hilo).
 
-    Devuelve (ruta, título, duración, altura_usada).
+    Devuelve (ruta, título, duración, altura_usada, thumbnail).
     """
     ydl_opts = {
         "format": _build_format(),
@@ -212,6 +223,7 @@ def _download_sync(
         raise VideoUnavailableError("No se pudo leer la información del video.")
     duration = info.get("duration")
     title = (info.get("title") or "").strip() or out_path.stem
+    thumbnail = _normalize_thumbnail(info.get("thumbnail"))
     if duration and duration > settings.max_video_minutes * 60:
         raise VideoTooLongError(
             f"El video dura más de {settings.max_video_minutes} minutos."
@@ -229,7 +241,7 @@ def _download_sync(
                     "Descarga con formato pre-ajustado (<= %d bytes, altura<=480p)",
                     max_bytes,
                 )
-                return candidates[0], title, duration, 480
+                return candidates[0], title, duration, 480, thumbnail
             for c in candidates:
                 c.unlink(missing_ok=True)
         except yt_dlp.utils.DownloadError:
@@ -284,7 +296,7 @@ def _download_sync(
     logger.info(
         "Tamaño real final: %d bytes (altura %dp)", final_path.stat().st_size, height
     )
-    return final_path, title, duration, height
+    return final_path, title, duration, height, thumbnail
 
 
 class _YdlLogger:
@@ -336,7 +348,7 @@ async def download_video(url: str, max_bytes: int | None = None) -> DownloadResu
     start = time.perf_counter()
     async with _semaphore:
         try:
-            path, title, duration, height = await asyncio.to_thread(
+            path, title, duration, height, thumbnail = await asyncio.to_thread(
                 _download_sync, url, out_path, max_bytes
             )
         except VideoError:
@@ -353,6 +365,7 @@ async def download_video(url: str, max_bytes: int | None = None) -> DownloadResu
         duration=duration,
         size=size,
         height=height,
+        thumbnail=thumbnail,
     )
 
 
@@ -502,6 +515,7 @@ async def recompress_video(
         duration=result.duration,
         size=dst.stat().st_size,
         height=result.height,
+        thumbnail=result.thumbnail,
     )
 
 
