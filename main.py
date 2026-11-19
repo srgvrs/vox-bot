@@ -25,6 +25,7 @@ COGS = [
     "cogs.enlaces",
     "cogs.admin",
     "cogs.mensajes",
+    "cogs.chat",
 ]
 
 _SHUTDOWN_TIMEOUT_SECONDS = 30
