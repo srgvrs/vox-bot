@@ -35,6 +35,19 @@ class Settings:
     r2_bucket: str = os.getenv("R2_BUCKET", "")
     link_expiry_hours: int = _int("LINK_EXPIRY_HOURS", 24)
 
+    # Hosts externos de subida (orden de preferencia)
+    storage_providers: tuple[str, ...] = tuple(
+        x.strip().lower()
+        for x in os.getenv("STORAGE_PROVIDERS", "litterbox,storage_to,gofile").split(",")
+        if x.strip()
+    )
+    litterbox_expiry: str = os.getenv("LITTERBOX_EXPIRY", "24h")
+    storage_to_expiry_hours: int = _int("STORAGE_TO_EXPIRY_HOURS", 72)
+    gofile_expiry_hours: int = _int("GOFILE_EXPIRY_HOURS", 24)
+    storage_timeout_seconds: int = _int("STORAGE_TIMEOUT_SECONDS", 60)
+    storage_max_retries: int = _int("STORAGE_MAX_RETRIES", 2)
+    storage_circuit_seconds: int = _int("STORAGE_CIRCUIT_SECONDS", 300)
+
     # Seguridad / límites
     allowed_guild_ids: tuple[int, ...] = tuple(
         int(x) for x in os.getenv("ALLOWED_GUILD_IDS", "").replace(" ", "").split(",") if x.isdigit()
