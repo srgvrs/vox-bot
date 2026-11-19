@@ -6,7 +6,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# override=True: el .env gana sobre variables ya definidas en el entorno del
+# hosting (p. ej. panel Pterodactyl), que suele inyectar valores obsoletos.
+load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,9 @@ class Settings:
     max_concurrent_downloads: int = _int("MAX_CONCURRENT_DOWNLOADS", 2)
     max_uploads_per_user_day: int = _int("MAX_UPLOADS_PER_USER_DAY", 10)
     temp_dir: Path = Path(os.getenv("TEMP_DIR", "temp"))
+
+    # Encoder de recompresión: auto | libx264 | h264_qsv
+    encoder: str = os.getenv("ENCODER", "auto").strip().lower() or "auto"
 
     # Hosts externos de subida (orden de preferencia)
     storage_providers: tuple[str, ...] = tuple(
@@ -96,8 +101,21 @@ class Settings:
 settings = Settings()
 
 logger.info(
-    "Config cargada: admin_user_ids=%s, allowed_guild_ids=%s, upload_limit_mb=%d",
+    "Config cargada: admin_user_ids=%s, allowed_guild_ids=%s, upload_limit_mb=%d, "
+    "recompress_max_minutes=%d, encoder=%s",
     settings.admin_user_ids,
     settings.allowed_guild_ids,
     settings.upload_limit_mb,
+    settings.recompress_max_minutes,
+    settings.encoder,
 )
+if settings.recompress_max_minutes <= 0:
+    logger.warning(
+        "RECOMPRESS_MAX_MINUTES=0: recompresión desactivada; los videos que no "
+        "quepan como adjunto se subirán a un host externo."
+    )
+if settings.encoder not in ("auto", "libx264", "h264_qsv"):
+    logger.warning(
+        "ENCODER=%r no reconocido; se usará 'auto'. Valores válidos: auto, libx264, h264_qsv.",
+        settings.encoder,
+    )

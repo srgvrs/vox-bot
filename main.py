@@ -13,6 +13,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from config import settings
@@ -33,13 +34,13 @@ class MediaBot(commands.Bot):
         for cog in COGS:
             await self.load_extension(cog)
         await _log_versions()
-        self.tree.copy_global_to(guild=discord.Object(id=0)) if False else None
+        self.tree.error(self._on_app_command_error)
         if settings.allowed_guild_ids:
             for guild_id in settings.allowed_guild_ids:
                 guild = discord.Object(id=guild_id)
                 self.tree.copy_global_to(guild=guild)
                 try:
-                    await self.tree.sync(guild=guild)
+                    synced = await self.tree.sync(guild=guild)
                 except (discord.Forbidden, discord.HTTPException) as exc:
                     logging.error(
                         "No se pudieron sincronizar los comandos en el servidor %s: %s. "
@@ -49,10 +50,37 @@ class MediaBot(commands.Bot):
                         exc,
                     )
                     continue
-                logging.info("Comandos sincronizados en guild %s", guild_id)
+                _log_synced_commands(synced, scope=f"guild {guild_id}")
         else:
-            await self.tree.sync()
-            logging.info("Comandos sincronizados globalmente (sin ALLOWED_GUILD_IDS)")
+            synced = await self.tree.sync()
+            _log_synced_commands(synced, scope="global")
+
+    async def _on_app_command_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        """Manejador global de errores de slash commands."""
+        logging.getLogger(__name__).exception(
+            "Error no controlado en comando %s",
+            getattr(interaction.command, "name", "?"),
+            exc_info=error,
+        )
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "Ocurrió un error inesperado al procesar el comando.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    "Ocurrió un error inesperado al procesar el comando.",
+                    ephemeral=True,
+                )
+        except discord.HTTPException:
+            logging.getLogger(__name__).exception(
+                "No se pudo responder al error del comando"
+            )
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         if settings.allowed_guild_ids and guild.id not in settings.allowed_guild_ids:
@@ -62,6 +90,19 @@ class MediaBot(commands.Bot):
             await guild.leave()
         else:
             logging.info("Unido a guild permitido %s (%s)", guild.id, guild.name)
+
+
+def _log_synced_commands(
+    synced: list[app_commands.AppCommand], scope: str
+) -> None:
+    """Registra los comandos sincronizados para verificar que existen."""
+    names = sorted(cmd.name for cmd in synced)
+    logging.info(
+        "Comandos sincronizados (%s): %d -> %s",
+        scope,
+        len(names),
+        ", ".join(names) if names else "(ninguno)",
+    )
 
 
 def _setup_logging() -> None:

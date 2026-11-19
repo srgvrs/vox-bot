@@ -180,6 +180,11 @@ class Imagenes(commands.Cog):
 
     @app_commands.command(name="img", description="Busca imágenes")
     async def img(self, interaction: discord.Interaction, consulta: str) -> None:
+        logger.info(
+            "Comando /img invocado por %s en guild %s",
+            interaction.user.id,
+            interaction.guild_id,
+        )
         try:
             if not _is_allowed(interaction):
                 await interaction.response.send_message(

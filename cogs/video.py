@@ -36,6 +36,14 @@ _upload_limiter = DailyUserLimiter(settings.max_uploads_per_user_day)
 _storage_chain = StorageChain()
 _cooldowns: dict[int, float] = defaultdict(float)
 
+# Margen de seguridad al decidir si un archivo cabe como adjunto.
+_ATTACHMENT_SAFETY_MARGIN = 0.97
+
+
+def _is_attachment_too_large(exc: discord.HTTPException) -> bool:
+    """Detecta el rechazo de Discord por adjunto demasiado grande (413 / 40005)."""
+    return getattr(exc, "status", None) == 413 or getattr(exc, "code", None) == 40005
+
 
 def _is_allowed(interaction: discord.Interaction) -> bool:
     """Permite solo en guilds autorizados; rechaza DMs."""
@@ -255,6 +263,40 @@ class MessageResponder:
             logger.exception("No se pudo editar el mensaje de error")
 
 
+async def _upload_external(
+    final: DownloadResult,
+    user_id: int,
+    responder: Responder,
+    recompressed: bool,
+) -> None:
+    """Sube el archivo a un host externo y envía el link."""
+    if not _upload_limiter.is_allowed(user_id):
+        await responder.send_error(
+            "Alcanzaste el límite diario de subidas externas. Intenta de nuevo mañana."
+        )
+        return
+
+    await responder.set_status(
+        "El video es muy grande para Discord, se subirá a un host externo "
+        "(puede tardar un poco)...",
+    )
+    start = time.perf_counter()
+    try:
+        upload: UploadResult = await _storage_chain.upload(final.path)
+    except StorageError as exc:
+        logger.exception("Fallo de StorageChain")
+        await responder.send_error(f"No se pudo subir el video: {str(exc)[:300]}")
+        return
+
+    _upload_limiter.consume(user_id)
+    logger.info(
+        "Subida externa completada en %.2f s (%s)",
+        time.perf_counter() - start,
+        upload.provider,
+    )
+    await responder.send_result(final, recompressed=recompressed, upload=upload)
+
+
 async def run_video_flow(
     url: str,
     user_id: int,
@@ -272,30 +314,51 @@ async def run_video_flow(
         urlparse(url).hostname,
     )
 
+    # Margen de seguridad: Discord rechaza adjuntos que rozan el límite.
+    safe_bytes = int(max_bytes * _ATTACHMENT_SAFETY_MARGIN)
+
     result: DownloadResult | None = None
     recompressed: DownloadResult | None = None
     try:
         result = await download_video(
             url,
-            max_bytes=max_bytes,
+            max_bytes=safe_bytes,
             on_status=responder.set_status,
         )
         logger.info(
-            "Descarga OK: %s (%d bytes, límite adjunto %d bytes)",
+            "Descarga OK: %s (%d bytes, límite adjunto seguro %d bytes)",
             result.title,
             result.size,
-            max_bytes,
+            safe_bytes,
         )
 
         # 1) Intentar adjunto directo.
-        if result.size <= max_bytes:
-            await responder.send_result(result, recompressed=False, upload=None)
+        if result.size <= safe_bytes:
+            try:
+                await responder.send_result(result, recompressed=False, upload=None)
+                return
+            except discord.HTTPException as exc:
+                if _is_attachment_too_large(exc):
+                    logger.warning(
+                        "Discord rechazó el adjunto (%d bytes, status=%s, code=%s); "
+                        "se cae al flujo de subida externa.",
+                        result.size,
+                        getattr(exc, "status", "?"),
+                        getattr(exc, "code", "?"),
+                    )
+                else:
+                    raise
+            await _upload_external(result, user_id, responder, recompressed=False)
             return
 
         # 2) Recomprimir una sola vez (si la duración lo permite).
         duration_known = result.duration is not None and result.duration > 0
         duration_min = (result.duration or 0) / 60
-        if duration_known and duration_min > settings.recompress_max_minutes:
+        if settings.recompress_max_minutes <= 0:
+            logger.info(
+                "Se omite la recompresión: RECOMPRESS_MAX_MINUTES=0 (desactivada)."
+            )
+        elif duration_known and duration_min > settings.recompress_max_minutes:
             logger.info(
                 "Se omite la recompresión: duración %.1f min > RECOMPRESS_MAX_MINUTES=%d",
                 duration_min,
@@ -305,7 +368,7 @@ async def run_video_flow(
             try:
                 recompressed = await recompress_video(
                     result,
-                    max_bytes,
+                    safe_bytes,
                     on_status=responder.set_status,
                 )
                 logger.info(
@@ -313,50 +376,42 @@ async def run_video_flow(
                     recompressed.size,
                     result.size,
                 )
-                if recompressed.size <= max_bytes:
-                    await responder.send_result(
-                        recompressed, recompressed=True, upload=None
-                    )
-                    return
+                if recompressed.size <= safe_bytes:
+                    try:
+                        await responder.send_result(
+                            recompressed, recompressed=True, upload=None
+                        )
+                        return
+                    except discord.HTTPException as exc:
+                        if _is_attachment_too_large(exc):
+                            logger.warning(
+                                "Discord rechazó el adjunto recomprimido "
+                                "(%d bytes, status=%s, code=%s); se sube el original.",
+                                recompressed.size,
+                                getattr(exc, "status", "?"),
+                                getattr(exc, "code", "?"),
+                            )
+                            recompressed.path.unlink(missing_ok=True)
+                            recompressed = None
+                        else:
+                            raise
             except RecompressError as exc:
                 logger.warning("Recompresión fallida: %s", exc)
 
         # 3) Subida externa. Si el recomprimido no cabe, se sube el ORIGINAL.
-        if recompressed is not None and recompressed.size > max_bytes:
+        if recompressed is not None and recompressed.size > safe_bytes:
             logger.info(
                 "El recomprimido (%d bytes) no cabe en %d; se sube el original (%d bytes).",
                 recompressed.size,
-                max_bytes,
+                safe_bytes,
                 result.size,
             )
             recompressed.path.unlink(missing_ok=True)
             recompressed = None
         final = recompressed or result
-        if not _upload_limiter.is_allowed(user_id):
-            await responder.send_error(
-                "Alcanzaste el límite diario de subidas externas. Intenta de nuevo mañana."
-            )
-            return
-
-        await responder.set_status(
-            "El video es muy grande para Discord, se subirá a un host externo "
-            "(puede tardar un poco)...",
+        await _upload_external(
+            final, user_id, responder, recompressed=final is recompressed
         )
-        start = time.perf_counter()
-        try:
-            upload: UploadResult = await _storage_chain.upload(final.path)
-        except StorageError as exc:
-            logger.exception("Fallo de StorageChain")
-            await responder.send_error(f"No se pudo subir el video: {str(exc)[:300]}")
-            return
-
-        _upload_limiter.consume(user_id)
-        logger.info(
-            "Subida externa completada en %.2f s (%s)",
-            time.perf_counter() - start,
-            upload.provider,
-        )
-        await responder.send_result(final, recompressed=final is recompressed, upload=upload)
 
     except VideoTooLongError as exc:
         await responder.send_error(str(exc))
@@ -425,10 +480,16 @@ class Video(commands.Cog):
         # Si el guild reporta un límite mayor que el configurado, se usa el del guild.
         # Si el config es mayor (servidor boosteado con filesize_limit desactualizado),
         # se usa el config para no subir innecesariamente a un host externo.
-        max_bytes = max(guild_limit, config_limit) if guild_limit else config_limit
+        if guild_limit and guild_limit > config_limit:
+            max_bytes = guild_limit
+            winner = "guild"
+        else:
+            max_bytes = config_limit
+            winner = "env"
         logger.info(
-            "Límite de adjunto: %d bytes (env=%d MB, guild.filesize_limit=%d bytes)",
+            "Límite de adjunto: %d bytes (gana %s; env=%d MB, guild.filesize_limit=%d bytes)",
             max_bytes,
+            winner,
             settings.upload_limit_mb,
             guild_limit,
         )

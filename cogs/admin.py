@@ -71,6 +71,11 @@ class Admin(commands.Cog):
 
     @app_commands.command(name="estado", description="Estado del bot (solo admins)")
     async def estado(self, interaction: discord.Interaction) -> None:
+        logger.info(
+            "Comando /estado invocado por %s en guild %s",
+            interaction.user.id,
+            interaction.guild_id,
+        )
         try:
             if not _is_admin(interaction.user.id):
                 await interaction.response.send_message(

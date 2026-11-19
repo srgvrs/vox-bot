@@ -723,6 +723,8 @@ async def download_video(
 
 
 _qsv_available: bool | None = None
+# Recuerda si h264_qsv falló en tiempo de ejecución para no reintentarlo.
+_qsv_failed_runtime: bool = False
 
 
 def _has_qsv() -> bool:
@@ -745,6 +747,19 @@ def _has_qsv() -> bool:
     except Exception:
         _qsv_available = False
     return _qsv_available
+
+
+def _should_use_qsv() -> bool:
+    """Decide si usar h264_qsv según ENCODER y el historial de fallos."""
+    encoder = settings.encoder
+    if encoder == "libx264":
+        return False
+    if encoder == "h264_qsv":
+        return True
+    # auto: usar QSV solo si está disponible y no ha fallado antes.
+    if _qsv_failed_runtime:
+        return False
+    return _has_qsv()
 
 
 def _pick_height(video_kbps: int, original_height: int | None) -> int:
@@ -779,7 +794,7 @@ def _recompress_sync(
         raise RecompressError("ffmpeg no está disponible.")
 
     # Margen de seguridad: 20% con QSV (menos preciso), 10% con libx264.
-    use_qsv = force_encoder is None and _has_qsv()
+    use_qsv = force_encoder is None and _should_use_qsv()
     margin = 0.80 if use_qsv else 0.90
 
     audio_kbps = 64
@@ -830,20 +845,42 @@ def _recompress_sync(
             "+faststart",
             str(dst),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _, stderr = proc.communicate()
+        except KeyboardInterrupt:
+            # Cierre ordenado: terminar ffmpeg y limpiar el temporal.
+            logger.warning("SIGINT durante la recompresión; terminando ffmpeg.")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            dst.unlink(missing_ok=True)
+            raise
         if proc.returncode != 0:
-            tail = (proc.stderr or "").strip().splitlines()[-1:] or ["error desconocido"]
+            tail = (stderr or "").strip().splitlines()[-1:] or ["error desconocido"]
             logger.warning("Encoder %s falló: %s", encoder, tail[0][:200])
             return False
         return dst.exists() and dst.stat().st_size > 0
 
+    global _qsv_failed_runtime
     if use_qsv:
         logger.info("Recompresión usando encoder h264_qsv")
         if _run("h264_qsv", []):
             return video_kbps
-        logger.info("h264_qsv falló; reintentando con libx264")
+        _qsv_failed_runtime = True
+        logger.warning(
+            "h264_qsv falló; se usará libx264 en los próximos videos (hasta reiniciar)."
+        )
 
-    logger.info("Recompresión usando encoder libx264")
+    logger.info("Recompresión usando encoder libx264 (preset veryfast)")
     if not _run("libx264", ["-preset", "veryfast"]):
         raise RecompressError("Falló la recompresión con libx264.")
     return video_kbps
@@ -879,7 +916,12 @@ async def recompress_video(
         )
     except RecompressError:
         raise
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Cierre ordenado: borrar el temporal parcial y propagar.
+        dst.unlink(missing_ok=True)
+        raise
     except Exception as exc:
+        dst.unlink(missing_ok=True)
         raise RecompressError(f"Falló la recompresión: {exc}") from exc
 
     if not dst.exists():
