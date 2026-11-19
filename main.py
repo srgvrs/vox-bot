@@ -147,6 +147,16 @@ def _prepare_path() -> None:
             "No se pudo preparar ffmpeg desde imageio_ffmpeg: %s", exc
         )
 
+    try:
+        bin_dir = Path(__file__).resolve().parent / "bin"
+        deno_name = "deno.exe" if os.name == "nt" else "deno"
+        deno_path = bin_dir / deno_name
+        if deno_path.is_file():
+            os.chmod(deno_path, 0o755)
+            logging.info("Permisos de ejecución aplicados a %s", deno_path)
+    except Exception as exc:
+        logging.warning("No se pudo aplicar chmod a deno en ./bin: %s", exc)
+
 
 def _cleanup_temp_dir() -> None:
     """Borra archivos de TEMP_DIR con más de 1 hora de antigüedad.
