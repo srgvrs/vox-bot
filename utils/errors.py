@@ -45,6 +45,10 @@ def _sanitize(text: str) -> str:
     for secret in (
         settings.discord_token,
         settings.serper_api_key,
+        settings.groq_api_key,
+        settings.openrouter_api_key,
+        settings.deepseek_api_key,
+        settings.error_webhook_url,
     ):
         if secret:
             text = text.replace(secret, "***")
@@ -64,7 +68,10 @@ async def _send_webhook(payload: str) -> None:
                         "Webhook de errores devolvió HTTP %d", resp.status
                     )
     except Exception as exc:
-        logger.warning("No se pudo enviar el webhook de errores: %s", exc)
+        logger.warning(
+            "No se pudo enviar el webhook de errores: %s",
+            _sanitize(f"{type(exc).__name__}: {exc}"),
+        )
 
 
 async def report_error(source: str, exc: BaseException) -> None:

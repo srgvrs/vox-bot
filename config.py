@@ -1,7 +1,7 @@
 """Configuración centralizada. Lee variables de entorno (.env)."""
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -22,8 +22,12 @@ def _int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class Settings:
-    discord_token: str = os.getenv("DISCORD_TOKEN", "")
-    serper_api_key: str = os.getenv("SERPER_API_KEY", "")
+    discord_token: str = field(
+        default_factory=lambda: os.getenv("DISCORD_TOKEN", ""), repr=False
+    )
+    serper_api_key: str = field(
+        default_factory=lambda: os.getenv("SERPER_API_KEY", ""), repr=False
+    )
 
     # Video
     max_video_height: int = _int("MAX_VIDEO_HEIGHT", 720)
@@ -90,7 +94,9 @@ class Settings:
         for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",")
         if x.isdigit()
     )
-    error_webhook_url: str = os.getenv("ERROR_WEBHOOK_URL", "")
+    error_webhook_url: str = field(
+        default_factory=lambda: os.getenv("ERROR_WEBHOOK_URL", ""), repr=False
+    )
 
     # Estado animado de /video (formato <a:nombre:id> o vacío para spinner)
     status_emoji: str = os.getenv("STATUS_EMOJI", "")
@@ -127,13 +133,17 @@ class Settings:
     groq_base_url: str = os.getenv(
         "GROQ_BASE_URL", "https://api.groq.com/openai/v1"
     )
-    groq_api_key: str = os.getenv("GROQ_API_KEY", "")
+    groq_api_key: str = field(
+        default_factory=lambda: os.getenv("GROQ_API_KEY", ""), repr=False
+    )
     groq_model: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
     openrouter_base_url: str = os.getenv(
         "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
     )
-    openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
+    openrouter_api_key: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""), repr=False
+    )
     openrouter_model: str = os.getenv(
         "OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"
     )
@@ -141,7 +151,12 @@ class Settings:
     deepseek_base_url: str = os.getenv(
         "DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"
     )
-    deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
+    # BOT_DEEPSEEK_API_KEY (no DEEPSEEK_API_KEY) para no recoger la variable
+    # de entorno del sistema que usa Aider.
+    deepseek_api_key: str = field(
+        default_factory=lambda: os.getenv("BOT_DEEPSEEK_API_KEY", ""),
+        repr=False,
+    )
     deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
     chat_system_prompt: str = os.getenv(
