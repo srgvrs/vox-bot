@@ -83,6 +83,9 @@ class Settings:
         for x in os.getenv("AUTO_LINK_CHANNEL_IDS", "").replace(" ", "").split(",")
         if x.isdigit()
     )
+    delete_original_message: bool = os.getenv(
+        "DELETE_ORIGINAL_MESSAGE", "true"
+    ).lower() in ("1", "true", "yes", "on")
 
 
 settings = Settings()

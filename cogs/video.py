@@ -135,21 +135,56 @@ class InteractionResponder:
             logger.exception("No se pudo enviar el mensaje de error")
 
 
+_forbidden_warned_channels: set[int] = set()
+
+
 class MessageResponder:
-    """Responder basado en un mensaje (reply editado)."""
+    """Responder basado en un mensaje (reply o channel.send editado)."""
 
     def __init__(self, message: discord.Message) -> None:
         self.message = message
         self.reply: discord.Message | None = None
+        self.delete_original = settings.delete_original_message
+        self.author_label = f"Pedido por {message.author.display_name}"
 
     async def _ensure_reply(self, content: str) -> discord.Message:
         if self.reply is None:
-            self.reply = await self.message.reply(
-                content,
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            if self.delete_original:
+                self.reply = await self.message.channel.send(
+                    content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                self.reply = await self.message.reply(
+                    content,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
         return self.reply
+
+    async def _delete_original(self) -> None:
+        """Borra el mensaje original; tolera permisos y mensajes ya borrados."""
+        if not self.delete_original:
+            return
+        channel_id = self.message.channel.id
+        try:
+            await self.message.delete()
+        except discord.Forbidden:
+            if channel_id not in _forbidden_warned_channels:
+                _forbidden_warned_channels.add(channel_id)
+                logger.warning(
+                    "No se pudo borrar el mensaje original en el canal %s: "
+                    "falta permiso Administrar mensajes",
+                    channel_id,
+                )
+        except discord.NotFound:
+            logger.debug("El mensaje original ya no existe en el canal %s", channel_id)
+        except discord.HTTPException as exc:
+            logger.warning(
+                "HTTPException al borrar el mensaje original en el canal %s: %s",
+                channel_id,
+                exc,
+            )
 
     async def set_status(self, texto: str) -> None:
         reply = await self._ensure_reply(texto)
@@ -173,13 +208,17 @@ class MessageResponder:
             embed = discord.Embed(title=(result.title or "Video")[:256])
             if result.notice:
                 embed.description = result.notice
-            embed.set_footer(text=origen)
+            footer = origen
+            if self.delete_original:
+                footer = f"{origen} · {self.author_label}"
+            embed.set_footer(text=footer)
             await reply.edit(
                 content=None,
                 embed=embed,
                 attachments=[discord.File(result.path)],
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+            await self._delete_original()
             return
         origen = f"Subido a {upload.provider}"
         size_mb = result.size / (1024 * 1024)
@@ -193,14 +232,16 @@ class MessageResponder:
         )
         if result.thumbnail:
             embed.set_image(url=result.thumbnail)
-        embed.set_footer(
-            text=f"{origen} (caduca en {upload.expiry_hours} h) · {size_mb:.1f} MB"
-        )
+        footer = f"{origen} (caduca en {upload.expiry_hours} h) · {size_mb:.1f} MB"
+        if self.delete_original:
+            footer = f"{footer} · {self.author_label}"
+        embed.set_footer(text=footer)
         await reply.edit(
             content=None,
             embed=embed,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+        await self._delete_original()
 
     async def send_error(self, mensaje: str) -> None:
         reply = await self._ensure_reply(mensaje)
