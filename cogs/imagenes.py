@@ -8,9 +8,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from config import settings
 from media.validator import is_valid_image
 from search.base import ImageResult
+from search.chain import SearchChain
 from search.ddg import DuckDuckGoProvider
+from search.serper import SerperProvider
+from utils.cache import TTLCache, normalize_query
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +57,14 @@ class ImagePaginator(discord.ui.View):
         results: list[ImageResult],
         consulta: str,
         author_id: int,
+        provider_name: str,
     ) -> None:
         super().__init__(timeout=120)
         self.session = session
         self.results = results
         self.consulta = consulta
         self.author_id = author_id
+        self.provider_name = provider_name
         self.index = 0
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -84,7 +90,7 @@ class ImagePaginator(discord.ui.View):
         else:
             embed = discord.Embed(title=result.title or self.consulta)
             embed.set_image(url=result.url)
-        footer = f"Página {self.index + 1}/{total}"
+        footer = f"Página {self.index + 1}/{total} · {self.provider_name}"
         if result is not None and result.source:
             footer = f"{footer} · {result.source}"
         embed.set_footer(text=footer)
@@ -146,6 +152,12 @@ class Imagenes(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.session: aiohttp.ClientSession | None = None
+        providers = []
+        if settings.serper_api_key:
+            providers.append(SerperProvider())
+        providers.append(DuckDuckGoProvider())
+        self.chain = SearchChain(providers)
+        self.cache: TTLCache[tuple[list[ImageResult], str]] = TTLCache()
 
     async def cog_load(self) -> None:
         self.session = aiohttp.ClientSession()
@@ -159,15 +171,21 @@ class Imagenes(commands.Cog):
     async def img(self, interaction: discord.Interaction, consulta: str) -> None:
         await interaction.response.defer()
 
-        try:
-            results = await DuckDuckGoProvider().search(consulta, limit=100)
-        except Exception:
-            logger.exception("Fallo la búsqueda de imágenes para %r", consulta)
-            await interaction.followup.send(
-                "No pude completar la búsqueda de imágenes. Intenta de nuevo en un momento.",
-                ephemeral=True,
-            )
-            return
+        cache_key = normalize_query(consulta)
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            results, provider_name = cached
+        else:
+            try:
+                results, provider_name = await self.chain.search(consulta, limit=100)
+            except Exception:
+                logger.exception("Fallo la búsqueda de imágenes para %r", consulta)
+                await interaction.followup.send(
+                    "No pude completar la búsqueda de imágenes. Intenta de nuevo en un momento.",
+                    ephemeral=True,
+                )
+                return
+            self.cache.set(cache_key, (results, provider_name))
 
         if not results:
             await interaction.followup.send(
@@ -177,7 +195,9 @@ class Imagenes(commands.Cog):
             return
 
         assert self.session is not None
-        view = ImagePaginator(self.session, results, consulta, interaction.user.id)
+        view = ImagePaginator(
+            self.session, results, consulta, interaction.user.id, provider_name
+        )
         found = await view._find_valid(0)
         if found is None:
             view.index = 0
