@@ -594,6 +594,12 @@ def _download_sync(
         urlparse(url).hostname,
         f"{duration:.1f}s" if duration is not None else "desconocida",
     )
+    if max_bytes:
+        logger.info(
+            "Descargado: %.1f MB (límite de adjunto: %.1f MB)",
+            final_path.stat().st_size / (1024 * 1024),
+            max_bytes / (1024 * 1024),
+        )
     return final_path, title, duration, height, thumbnail, notice
 
 
@@ -955,6 +961,23 @@ async def recompress_video(
         target_bytes,
         real_size,
     )
+    logger.info(
+        "Recompresión: bitrate objetivo=%d kbps, resultado=%.1f MB (límite %.1f MB)",
+        video_kbps,
+        real_size / (1024 * 1024),
+        target_bytes / (1024 * 1024),
+    )
+    if real_size > target_bytes:
+        logger.info(
+            "Recompresión: sigue siendo demasiado grande (%.1f MB > %.1f MB)",
+            real_size / (1024 * 1024),
+            target_bytes / (1024 * 1024),
+        )
+    else:
+        logger.info(
+            "Recompresión: quedó en %.1f MB (cabe en el límite)",
+            real_size / (1024 * 1024),
+        )
 
     # Reintento si se pasa por menos del 25% del límite.
     if real_size > target_bytes and real_size <= target_bytes * 1.25:
@@ -992,6 +1015,14 @@ async def recompress_video(
                 )
 
     logger.info("Recompresión completada en %.2f s", time.perf_counter() - start)
+
+    final_size = dst.stat().st_size
+    if final_size > target_bytes:
+        logger.info(
+            "Sigue pesando %.1f MB; se subirá a un host externo (límite %.1f MB)",
+            final_size / (1024 * 1024),
+            target_bytes / (1024 * 1024),
+        )
 
     return DownloadResult(
         path=dst,

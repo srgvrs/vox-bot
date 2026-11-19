@@ -271,14 +271,26 @@ async def _upload_external(
 ) -> None:
     """Sube el archivo a un host externo y envía el link."""
     if not _upload_limiter.is_allowed(user_id):
+        logger.info(
+            "Subida externa rechazada: usuario=%s alcanzó MAX_UPLOADS_PER_USER_DAY=%d",
+            user_id,
+            settings.max_uploads_per_user_day,
+        )
         await responder.send_error(
             "Alcanzaste el límite diario de subidas externas. Intenta de nuevo mañana."
         )
         return
 
+    size_mb = final.size / (1024 * 1024)
     await responder.set_status(
-        "El video es muy grande para Discord, se subirá a un host externo "
-        "(puede tardar un poco)...",
+        f"El video pesa {size_mb:.1f} MB, supera el límite; "
+        "lo estoy subiendo a un host…",
+    )
+    logger.info(
+        "Subiendo a host externo: %.1f MB (usuario=%s, recomprimido=%s)",
+        size_mb,
+        user_id,
+        recompressed,
     )
     start = time.perf_counter()
     try:
@@ -307,11 +319,12 @@ async def run_video_flow(
 ) -> None:
     """Flujo reutilizable de /video: descarga, recompresión y envío."""
     logger.info(
-        "Origen=%s usuario=%s canal=%s dominio=%s",
+        "Origen=%s usuario=%s canal=%s dominio=%s límite=%.1f MB",
         origin,
         user_id,
         channel_id,
         urlparse(url).hostname,
+        max_bytes / (1024 * 1024),
     )
 
     # Margen de seguridad: Discord rechaza adjuntos que rozan el límite.
@@ -334,6 +347,11 @@ async def run_video_flow(
 
         # 1) Intentar adjunto directo.
         if result.size <= safe_bytes:
+            logger.info(
+                "Enviando como adjunto: %.1f MB (límite %.1f MB)",
+                result.size / (1024 * 1024),
+                safe_bytes / (1024 * 1024),
+            )
             try:
                 await responder.send_result(result, recompressed=False, upload=None)
                 return
@@ -353,6 +371,13 @@ async def run_video_flow(
 
         # 2) Recomprimir una sola vez, solo si el archivo no cabe y las reglas
         #    de seguridad lo permiten. Si no, se sube directo al host externo.
+        logger.info(
+            "El archivo pesa %.1f MB y el límite es %.1f MB (origen: %s); "
+            "intento recomprimir",
+            result.size / (1024 * 1024),
+            safe_bytes / (1024 * 1024),
+            origin,
+        )
         duration_known = result.duration is not None and result.duration > 0
         duration_min = (result.duration or 0) / 60
         source_mb = result.size / (1024 * 1024)
@@ -396,6 +421,10 @@ async def run_video_flow(
                     result.size,
                 )
                 if recompressed.size <= safe_bytes:
+                    logger.info(
+                        "Enviando como adjunto (recomprimido): %.1f MB",
+                        recompressed.size / (1024 * 1024),
+                    )
                     try:
                         await responder.send_result(
                             recompressed, recompressed=True, upload=None
@@ -434,23 +463,35 @@ async def run_video_flow(
             recompressed.path.unlink(missing_ok=True)
             recompressed = None
         final = recompressed or result
+        logger.info(
+            "Subiendo a host externo: %.1f MB (recomprimido=%s)",
+            final.size / (1024 * 1024),
+            final is recompressed,
+        )
         await _upload_external(
             final, user_id, responder, recompressed=final is recompressed
         )
 
     except VideoTooLongError as exc:
+        logger.exception("Video demasiado largo")
         await responder.send_error(str(exc))
     except VideoRestrictedError as exc:
+        logger.exception("Video restringido")
         await responder.send_error(str(exc))
     except VideoUnsupportedError as exc:
+        logger.exception("Video no soportado")
         await responder.send_error(str(exc))
     except VideoNetworkError as exc:
+        logger.exception("Error de red al descargar el video")
         await responder.send_error(str(exc))
     except VideoLoginRequiredError as exc:
+        logger.exception("El origen exige iniciar sesión")
         await responder.send_error(str(exc))
     except VideoUnavailableError as exc:
+        logger.exception("Video no disponible")
         await responder.send_error(str(exc))
     except VideoError as exc:
+        logger.exception("Error de video")
         await responder.send_error(str(exc))
     except asyncio.TimeoutError as exc:
         logger.exception("Timeout en /video")
@@ -517,6 +558,14 @@ class Video(commands.Cog):
             winner,
             settings.upload_limit_mb,
             guild_limit,
+        )
+        logger.info(
+            "Solicitud /video: usuario=%s servidor=%s url=%s límite=%.1f MB (origen=%s)",
+            interaction.user.id,
+            interaction.guild.id if interaction.guild else "DM",
+            url,
+            max_bytes / (1024 * 1024),
+            winner,
         )
 
         await run_video_flow(

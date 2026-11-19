@@ -197,6 +197,10 @@ class StorageChain:
         size = path.stat().st_size
         size_mb = size / (1024 * 1024)
         errors: list[str] = []
+        logger.info(
+            "StorageChain: proveedores disponibles en orden: %s",
+            ", ".join(p.name for p in self.providers) or "(ninguno)",
+        )
 
         # Timeout proporcional al tamaño: 30 s base + 6 s por MB.
         total = 30 + int(6 * size_mb)
@@ -207,9 +211,18 @@ class StorageChain:
         ) as session:
             for provider in self.providers:
                 if provider.max_bytes is not None and size > provider.max_bytes:
+                    logger.info(
+                        "Se omite %s: archivo de %.1f MB supera el máximo de %.1f MB",
+                        provider.name,
+                        size_mb,
+                        provider.max_bytes / (1024 * 1024),
+                    )
                     errors.append(f"{provider.name}: archivo demasiado grande")
                     continue
                 if self._is_skipped(provider.name):
+                    logger.info(
+                        "Se omite %s: circuit breaker abierto", provider.name
+                    )
                     errors.append(f"{provider.name}: circuit breaker abierto")
                     continue
 
@@ -217,21 +230,22 @@ class StorageChain:
                 for attempt in range(2):
                     start = time.perf_counter()
                     logger.info(
-                        "Subida a %s: intento %d, %.2f MB",
+                        "Intentando %s con archivo de %.1f MB (intento %d)",
                         provider.name,
-                        attempt + 1,
                         size_mb,
+                        attempt + 1,
                     )
                     try:
                         url = await provider.upload(session, path)
                         elapsed = time.perf_counter() - start
                         self._record_success(provider.name)
                         logger.info(
-                            "Subida a %s OK: intento %d, %.2f MB, %.2f s",
+                            "Subida a %s OK: intento %d, %.2f MB, %.2f s, url=%s",
                             provider.name,
                             attempt + 1,
                             size_mb,
                             elapsed,
+                            url,
                         )
                         return UploadResult(
                             url=url,
@@ -250,6 +264,9 @@ class StorageChain:
                             exc,
                         )
                         errors.append(f"{provider.name}: error de certificado SSL")
+                        logger.info(
+                            "Resultado %s: error de certificado SSL", provider.name
+                        )
                         break
                     except asyncio.TimeoutError:
                         elapsed = time.perf_counter() - start
@@ -261,6 +278,7 @@ class StorageChain:
                             elapsed,
                         )
                         errors.append(f"{provider.name}: timeout")
+                        logger.info("Resultado %s: timeout", provider.name)
                     except aiohttp.ClientResponseError as exc:
                         elapsed = time.perf_counter() - start
                         logger.warning(
@@ -273,6 +291,9 @@ class StorageChain:
                             exc.status,
                         )
                         errors.append(f"{provider.name}: HTTP {exc.status}")
+                        logger.info(
+                            "Resultado %s: HTTP %d", provider.name, exc.status
+                        )
                         if exc.status < 500:
                             break
                     except aiohttp.ClientError as exc:
@@ -286,6 +307,9 @@ class StorageChain:
                             type(exc).__name__,
                         )
                         errors.append(f"{provider.name}: {type(exc).__name__}")
+                        logger.info(
+                            "Resultado %s: %s", provider.name, type(exc).__name__
+                        )
                         break
                     except StorageError as exc:
                         elapsed = time.perf_counter() - start
@@ -298,6 +322,7 @@ class StorageChain:
                             exc,
                         )
                         errors.append(f"{provider.name}: {exc}")
+                        logger.info("Resultado %s: %s", provider.name, exc)
                         break
                     except Exception as exc:
                         elapsed = time.perf_counter() - start
@@ -310,6 +335,9 @@ class StorageChain:
                             type(exc).__name__,
                         )
                         errors.append(f"{provider.name}: {type(exc).__name__}")
+                        logger.info(
+                            "Resultado %s: %s", provider.name, type(exc).__name__
+                        )
                         break
 
                     if attempt == 0:
