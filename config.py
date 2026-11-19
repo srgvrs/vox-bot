@@ -31,6 +31,15 @@ class Settings:
     host_max_mb: int = _int("HOST_MAX_MB", 35)
     max_video_minutes: int = _int("MAX_VIDEO_MINUTES", 15)
     recompress_max_minutes: int = _int("RECOMPRESS_MAX_MINUTES", 3)
+    recompress_enabled: bool = os.getenv("RECOMPRESS_ENABLED", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    # 0 = sin tope de tamaño de origen para recomprimir.
+    recompress_max_source_mb: int = _int("RECOMPRESS_MAX_SOURCE_MB", 30)
+    recompress_timeout_s: int = _int("RECOMPRESS_TIMEOUT_S", 180)
     instagram_long_reel_seconds: int = _int("INSTAGRAM_LONG_REEL_SECONDS", 60)
     video_cooldown_seconds: int = _int("VIDEO_COOLDOWN_SECONDS", 30)
     upload_limit_mb: int = _int("DISCORD_UPLOAD_LIMIT_MB", 10)
@@ -102,14 +111,23 @@ settings = Settings()
 
 logger.info(
     "Config cargada: admin_user_ids=%s, allowed_guild_ids=%s, upload_limit_mb=%d, "
-    "recompress_max_minutes=%d, encoder=%s",
+    "recompress_max_minutes=%d, encoder=%s, recompress_enabled=%s, "
+    "recompress_max_source_mb=%d, recompress_timeout_s=%d",
     settings.admin_user_ids,
     settings.allowed_guild_ids,
     settings.upload_limit_mb,
     settings.recompress_max_minutes,
     settings.encoder,
+    settings.recompress_enabled,
+    settings.recompress_max_source_mb,
+    settings.recompress_timeout_s,
 )
-if settings.recompress_max_minutes <= 0:
+if not settings.recompress_enabled:
+    logger.warning(
+        "RECOMPRESS_ENABLED=false: recompresión desactivada; los videos que no "
+        "quepan como adjunto se subirán a un host externo."
+    )
+elif settings.recompress_max_minutes <= 0:
     logger.warning(
         "RECOMPRESS_MAX_MINUTES=0: recompresión desactivada; los videos que no "
         "quepan como adjunto se subirán a un host externo."

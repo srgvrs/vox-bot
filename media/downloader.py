@@ -820,6 +820,8 @@ def _recompress_sync(
         margin * 100,
     )
 
+    timeout_s = settings.recompress_timeout_s
+
     def _run(encoder: str, extra: list[str]) -> bool:
         cmd = [
             ffmpeg,
@@ -852,7 +854,24 @@ def _recompress_sync(
             text=True,
         )
         try:
-            _, stderr = proc.communicate()
+            try:
+                _, stderr = proc.communicate(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                # Timeout: matar ffmpeg y limpiar el temporal.
+                logger.warning(
+                    "Recompresión con %s excedió RECOMPRESS_TIMEOUT_S=%d; "
+                    "terminando ffmpeg.",
+                    encoder,
+                    timeout_s,
+                )
+                proc.kill()
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.warning("ffmpeg no terminó tras kill; se continúa.")
+                raise RecompressError(
+                    f"Recompresión excedió el tiempo máximo ({timeout_s} s)."
+                )
         except KeyboardInterrupt:
             # Cierre ordenado: terminar ffmpeg y limpiar el temporal.
             logger.warning("SIGINT durante la recompresión; terminando ffmpeg.")
@@ -862,8 +881,11 @@ def _recompress_sync(
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-            dst.unlink(missing_ok=True)
             raise
+        finally:
+            # Nunca dejar el temporal parcial si algo falló.
+            if proc.returncode is None or proc.returncode != 0:
+                dst.unlink(missing_ok=True)
         if proc.returncode != 0:
             tail = (stderr or "").strip().splitlines()[-1:] or ["error desconocido"]
             logger.warning("Encoder %s falló: %s", encoder, tail[0][:200])

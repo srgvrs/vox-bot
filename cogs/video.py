@@ -351,20 +351,39 @@ async def run_video_flow(
             await _upload_external(result, user_id, responder, recompressed=False)
             return
 
-        # 2) Recomprimir una sola vez (si la duración lo permite).
+        # 2) Recomprimir una sola vez, solo si el archivo no cabe y las reglas
+        #    de seguridad lo permiten. Si no, se sube directo al host externo.
         duration_known = result.duration is not None and result.duration > 0
         duration_min = (result.duration or 0) / 60
-        if settings.recompress_max_minutes <= 0:
-            logger.info(
-                "Se omite la recompresión: RECOMPRESS_MAX_MINUTES=0 (desactivada)."
+        source_mb = result.size / (1024 * 1024)
+        max_source_mb = settings.recompress_max_source_mb
+        skip_reason: str | None = None
+        if not settings.recompress_enabled:
+            skip_reason = "RECOMPRESS_ENABLED=false (desactivada)"
+        elif settings.recompress_max_minutes <= 0:
+            skip_reason = "RECOMPRESS_MAX_MINUTES=0 (desactivada)"
+        elif not duration_known:
+            skip_reason = "duración desconocida (no se pudo medir con ffprobe)"
+        elif duration_min > settings.recompress_max_minutes:
+            skip_reason = (
+                f"duración {duration_min:.1f} min > "
+                f"RECOMPRESS_MAX_MINUTES={settings.recompress_max_minutes}"
             )
-        elif duration_known and duration_min > settings.recompress_max_minutes:
-            logger.info(
-                "Se omite la recompresión: duración %.1f min > RECOMPRESS_MAX_MINUTES=%d",
-                duration_min,
-                settings.recompress_max_minutes,
+        elif max_source_mb > 0 and source_mb > max_source_mb:
+            skip_reason = (
+                f"tamaño origen {source_mb:.1f} MB > "
+                f"RECOMPRESS_MAX_SOURCE_MB={max_source_mb}"
             )
-        elif ffmpeg_available() and duration_known:
+        elif not ffmpeg_available():
+            skip_reason = "ffmpeg no disponible"
+
+        if skip_reason is not None:
+            logger.info(
+                "Se omite la recompresión: %s. Se sube el original (%d bytes) al host externo.",
+                skip_reason,
+                result.size,
+            )
+        else:
             try:
                 recompressed = await recompress_video(
                     result,
@@ -396,7 +415,13 @@ async def run_video_flow(
                         else:
                             raise
             except RecompressError as exc:
-                logger.warning("Recompresión fallida: %s", exc)
+                logger.warning(
+                    "Recompresión fallida (%s); se sube el original al host externo.",
+                    exc,
+                )
+                if recompressed is not None:
+                    recompressed.path.unlink(missing_ok=True)
+                    recompressed = None
 
         # 3) Subida externa. Si el recomprimido no cabe, se sube el ORIGINAL.
         if recompressed is not None and recompressed.size > safe_bytes:
