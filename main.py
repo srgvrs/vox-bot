@@ -1,9 +1,11 @@
 """Punto de entrada del bot."""
 import asyncio
 import logging
+import os
 import platform
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -95,6 +97,55 @@ def _setup_logging() -> None:
         )
         file_handler.setFormatter(fmt)
         root.addHandler(file_handler)
+
+
+def _prepare_path() -> None:
+    """Prepara el PATH: antepone ./bin y, si falta ffmpeg, lo copia desde imageio_ffmpeg.
+
+    No debe romper el arranque: cualquier fallo se registra como WARNING.
+    """
+    try:
+        bin_dir = Path(__file__).resolve().parent / "bin"
+        if bin_dir.is_dir():
+            current = os.environ.get("PATH", "")
+            bin_str = str(bin_dir)
+            parts = current.split(os.pathsep) if current else []
+            if bin_str not in parts:
+                os.environ["PATH"] = bin_str + (os.pathsep + current if current else "")
+                logging.info("PATH: se antepuso %s", bin_str)
+    except Exception as exc:
+        logging.warning("No se pudo anteponer ./bin al PATH: %s", exc)
+
+    if shutil.which("ffmpeg"):
+        return
+
+    try:
+        import imageio_ffmpeg
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if not exe:
+            logging.warning("imageio_ffmpeg no devolvió una ruta de ffmpeg.")
+            return
+        bin_dir = Path(__file__).resolve().parent / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        target_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+        target = bin_dir / target_name
+        if not target.exists():
+            shutil.copy2(exe, target)
+            try:
+                target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            except OSError:
+                pass
+            logging.info("ffmpeg copiado desde imageio_ffmpeg a %s", target)
+        current = os.environ.get("PATH", "")
+        bin_str = str(bin_dir)
+        parts = current.split(os.pathsep) if current else []
+        if bin_str not in parts:
+            os.environ["PATH"] = bin_str + (os.pathsep + current if current else "")
+    except Exception as exc:
+        logging.warning(
+            "No se pudo preparar ffmpeg desde imageio_ffmpeg: %s", exc
+        )
 
 
 def _cleanup_temp_dir() -> None:
@@ -202,6 +253,7 @@ async def _shutdown(bot: MediaBot) -> None:
 
 async def main() -> None:
     _setup_logging()
+    _prepare_path()
     _cleanup_temp_dir()
     if not settings.discord_token:
         raise SystemExit("Falta DISCORD_TOKEN en el archivo .env")
