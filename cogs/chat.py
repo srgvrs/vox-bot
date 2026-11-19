@@ -21,7 +21,8 @@ from utils.errors import UNEXPECTED_ERROR_MESSAGE, new_error_ref, report_error
 logger = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
-_MAX_OUTPUT_CHARS = 1900
+_MAX_OUTPUT_CHARS = 3900
+_MAX_QUESTION_CHARS = 1000
 _MEMORY_TURNS = 6
 _MEMORY_TTL_S = 15 * 60
 
@@ -129,10 +130,35 @@ def _build_messages(memory: _Memory, user_text: str) -> list[dict[str, str]]:
     return messages
 
 
-def _truncate(text: str) -> str:
-    if len(text) <= _MAX_OUTPUT_CHARS:
+def _truncate(text: str, limit: int = _MAX_OUTPUT_CHARS) -> str:
+    if len(text) <= limit:
         return text
-    return text[: _MAX_OUTPUT_CHARS - 1] + "…"
+    return text[: limit - 1] + "…"
+
+
+def _build_embed(
+    user: discord.abc.User,
+    result,
+    question: str | None = None,
+) -> discord.Embed:
+    embed = discord.Embed(
+        description=_truncate(result.text, _MAX_OUTPUT_CHARS),
+        color=discord.Color.blurple(),
+    )
+    embed.set_author(
+        name=user.display_name,
+        icon_url=user.display_avatar.url,
+    )
+    if question is not None:
+        embed.add_field(
+            name="Pregunta",
+            value=_truncate(question, _MAX_QUESTION_CHARS),
+            inline=False,
+        )
+    embed.set_footer(
+        text=f"Respondido por {result.provider_label or result.provider} · {result.model}"
+    )
+    return embed
 
 
 class Chat(commands.Cog):
@@ -246,7 +272,7 @@ class Chat(commands.Cog):
         memory.last_used = time.monotonic()
 
         await message.reply(
-            _truncate(result.text),
+            embed=_build_embed(message.author, result),
             mention_author=False,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -339,7 +365,7 @@ class Chat(commands.Cog):
         memory.last_used = time.monotonic()
 
         await interaction.followup.send(
-            _truncate(result.text),
+            embed=_build_embed(interaction.user, result, question=texto),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 

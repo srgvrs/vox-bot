@@ -26,6 +26,13 @@ _DEFAULT_RETRY_AFTER_S = 60
 _CIRCUIT_FAILURES = 3
 _CIRCUIT_SECONDS = 300
 
+# Nombres legibles para mostrar en el pie de los embeds.
+_PROVIDER_LABELS = {
+    "groq": "Groq",
+    "openrouter": "OpenRouter",
+    "deepseek": "DeepSeek",
+}
+
 
 class AIError(Exception):
     """Error genérico del cliente de IA."""
@@ -57,6 +64,7 @@ class AIResult:
     provider: str
     model: str
     elapsed_s: float
+    provider_label: str = ""
 
 
 @dataclass
@@ -181,6 +189,9 @@ class AIChain:
                 provider=entry.provider,
                 model=entry.model,
                 elapsed_s=time.monotonic() - start,
+                provider_label=_PROVIDER_LABELS.get(
+                    entry.provider, entry.provider
+                ),
             )
         raise _TransientError(str(last_exc) if last_exc else "fallo desconocido")
 
