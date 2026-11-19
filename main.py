@@ -19,7 +19,13 @@ from discord.ext import commands
 from config import settings
 from utils.errors import UNEXPECTED_ERROR_MESSAGE, new_error_ref, report_error
 
-COGS = ["cogs.imagenes", "cogs.video", "cogs.enlaces", "cogs.admin"]
+COGS = [
+    "cogs.imagenes",
+    "cogs.video",
+    "cogs.enlaces",
+    "cogs.admin",
+    "cogs.mensajes",
+]
 
 _SHUTDOWN_TIMEOUT_SECONDS = 30
 

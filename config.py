@@ -111,6 +111,10 @@ class Settings:
         "DELETE_ORIGINAL_MESSAGE", "true"
     ).lower() in ("1", "true", "yes", "on")
 
+    # Mensajes personalizados por usuario
+    custom_msg_cooldown_seconds: int = _int("CUSTOM_MSG_COOLDOWN_SECONDS", 30)
+    custom_msg_delete_after: int = _int("CUSTOM_MSG_DELETE_AFTER", 0)
+
 
 settings = Settings()
 
