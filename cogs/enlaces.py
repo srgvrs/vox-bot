@@ -1,6 +1,7 @@
 """Cog de enlaces: modo mención y modo automático para /video."""
 import logging
 import re
+import time
 
 import discord
 from discord.ext import commands
@@ -8,10 +9,15 @@ from discord.ext import commands
 from cogs.video import MessageResponder, check_cooldown, run_video_flow
 from config import settings
 from media.downloader import _host_allowed
+from utils.errors import UNEXPECTED_ERROR_MESSAGE, new_error_ref, report_error
 
 logger = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+
+# Anti-spam del aviso de error inesperado: máx. 1 por usuario cada 60 s.
+_UNEXPECTED_NOTICE_INTERVAL_S = 60
+_last_unexpected_notice: dict[int, float] = {}
 
 
 def _extract_video_url(text: str) -> str | None:
@@ -99,13 +105,57 @@ class Enlaces(commands.Cog):
         )
 
         responder = MessageResponder(message)
-        await run_video_flow(
-            url,
-            message.author.id,
-            responder,
-            max_bytes,
-            origin=origin,
-            channel_id=message.channel.id,
+        try:
+            await run_video_flow(
+                url,
+                message.author.id,
+                responder,
+                max_bytes,
+                origin=origin,
+                channel_id=message.channel.id,
+            )
+        except Exception as exc:
+            ref = new_error_ref()
+            logger.exception(
+                "Error inesperado en enlaces (ref=%s) usuario=%s canal=%s url=%s",
+                ref,
+                message.author.id,
+                message.channel.id,
+                url,
+            )
+            await report_error(f"enlaces ref={ref}", exc)
+            await _notify_unexpected(message, responder, ref)
+
+
+async def _notify_unexpected(
+    message: discord.Message, responder: MessageResponder, ref: str
+) -> None:
+    """Avisa del error inesperado (máx. 1 por usuario cada 60 s).
+
+    Si ya hay un mensaje de progreso, se edita para no dejarlo colgado.
+    """
+    now = time.monotonic()
+    last = _last_unexpected_notice.get(message.author.id, 0.0)
+    if now - last < _UNEXPECTED_NOTICE_INTERVAL_S:
+        return
+    _last_unexpected_notice[message.author.id] = now
+
+    mensaje = UNEXPECTED_ERROR_MESSAGE.format(ref=ref)
+    try:
+        if responder.reply is not None:
+            await responder.reply.edit(
+                content=mensaje,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await message.reply(
+                mensaje,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+    except discord.HTTPException:
+        logger.debug(
+            "No se pudo enviar el aviso de error inesperado (ref=%s)", ref
         )
 
 

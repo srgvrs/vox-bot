@@ -17,6 +17,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import settings
+from utils.errors import UNEXPECTED_ERROR_MESSAGE, new_error_ref, report_error
 
 COGS = ["cogs.imagenes", "cogs.video", "cogs.enlaces", "cogs.admin"]
 
@@ -34,6 +35,7 @@ class MediaBot(commands.Bot):
         for cog in COGS:
             await self.load_extension(cog)
         await _log_versions()
+        self.tree.on_error = self._on_tree_error
         self.tree.error(self._on_app_command_error)
         if settings.allowed_guild_ids:
             for guild_id in settings.allowed_guild_ids:
@@ -54,6 +56,33 @@ class MediaBot(commands.Bot):
         else:
             synced = await self.tree.sync()
             _log_synced_commands(synced, scope="global")
+
+    async def _on_tree_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        """Manejador global (tree.on_error): log + mensaje genérico con ref."""
+        ref = new_error_ref()
+        logging.getLogger(__name__).exception(
+            "Error no controlado en comando %s (ref=%s) usuario=%s canal=%s",
+            getattr(interaction.command, "name", "?"),
+            ref,
+            interaction.user.id if interaction.user else "?",
+            interaction.channel_id,
+            exc_info=error,
+        )
+        await report_error(f"tree ref={ref}", error)
+        mensaje = UNEXPECTED_ERROR_MESSAGE.format(ref=ref)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(mensaje, ephemeral=True)
+            else:
+                await interaction.response.send_message(mensaje, ephemeral=True)
+        except discord.HTTPException:
+            logging.getLogger(__name__).debug(
+                "No se pudo responder al error del comando (ref=%s)", ref
+            )
 
     async def _on_app_command_error(
         self,

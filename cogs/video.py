@@ -26,7 +26,7 @@ from media.downloader import (
     recompress_video,
 )
 from media.storage import StorageChain, StorageError, UploadResult
-from utils.errors import report_error
+from utils.errors import UNEXPECTED_ERROR_MESSAGE, new_error_ref, report_error
 from utils.ratelimit import DailyUserLimiter
 from utils.status import StatusMessage
 
@@ -540,42 +540,68 @@ class Video(commands.Cog):
         responder = InteractionResponder(interaction)
         await responder.set_status("Buscando video...")
 
-        guild_limit = interaction.guild.filesize_limit if interaction.guild else 0
-        config_limit = settings.upload_limit_mb * 1024 * 1024
-        # Discord expone el límite real del servidor (10/25/50/100 MB según boosts).
-        # Si el guild reporta un límite mayor que el configurado, se usa el del guild.
-        # Si el config es mayor (servidor boosteado con filesize_limit desactualizado),
-        # se usa el config para no subir innecesariamente a un host externo.
-        if guild_limit and guild_limit > config_limit:
-            max_bytes = guild_limit
-            winner = "guild"
-        else:
-            max_bytes = config_limit
-            winner = "env"
-        logger.info(
-            "Límite de adjunto: %d bytes (gana %s; env=%d MB, guild.filesize_limit=%d bytes)",
-            max_bytes,
-            winner,
-            settings.upload_limit_mb,
-            guild_limit,
-        )
-        logger.info(
-            "Solicitud /video: usuario=%s servidor=%s url=%s límite=%.1f MB (origen=%s)",
-            interaction.user.id,
-            interaction.guild.id if interaction.guild else "DM",
-            url,
-            max_bytes / (1024 * 1024),
-            winner,
-        )
+        try:
+            guild_limit = interaction.guild.filesize_limit if interaction.guild else 0
+            config_limit = settings.upload_limit_mb * 1024 * 1024
+            # Discord expone el límite real del servidor (10/25/50/100 MB según boosts).
+            # Si el guild reporta un límite mayor que el configurado, se usa el del guild.
+            # Si el config es mayor (servidor boosteado con filesize_limit desactualizado),
+            # se usa el config para no subir innecesariamente a un host externo.
+            if guild_limit and guild_limit > config_limit:
+                max_bytes = guild_limit
+                winner = "guild"
+            else:
+                max_bytes = config_limit
+                winner = "env"
+            logger.info(
+                "Límite de adjunto: %d bytes (gana %s; env=%d MB, guild.filesize_limit=%d bytes)",
+                max_bytes,
+                winner,
+                settings.upload_limit_mb,
+                guild_limit,
+            )
+            logger.info(
+                "Solicitud /video: usuario=%s servidor=%s url=%s límite=%.1f MB (origen=%s)",
+                interaction.user.id,
+                interaction.guild.id if interaction.guild else "DM",
+                url,
+                max_bytes / (1024 * 1024),
+                winner,
+            )
 
-        await run_video_flow(
-            url,
-            interaction.user.id,
-            responder,
-            max_bytes,
-            origin="slash",
-            channel_id=interaction.channel_id,
-        )
+            await run_video_flow(
+                url,
+                interaction.user.id,
+                responder,
+                max_bytes,
+                origin="slash",
+                channel_id=interaction.channel_id,
+            )
+        except Exception as exc:
+            ref = new_error_ref()
+            logger.exception(
+                "Error inesperado en /video (ref=%s) usuario=%s canal=%s url=%s",
+                ref,
+                interaction.user.id,
+                interaction.channel_id,
+                url,
+            )
+            await report_error(f"video ref={ref}", exc)
+            await _reply_unexpected(interaction, ref)
+
+
+async def _reply_unexpected(
+    interaction: discord.Interaction, ref: str
+) -> None:
+    """Responde con el mensaje genérico (ephemeral) sin filtrar detalles."""
+    mensaje = UNEXPECTED_ERROR_MESSAGE.format(ref=ref)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(mensaje, ephemeral=True)
+        else:
+            await interaction.response.send_message(mensaje, ephemeral=True)
+    except discord.HTTPException:
+        logger.debug("No se pudo enviar el mensaje de error inesperado (ref=%s)", ref)
 
 
 async def setup(bot: commands.Bot) -> None:

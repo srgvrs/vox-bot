@@ -1,6 +1,7 @@
 """Reporte de errores: contador por hora y webhook opcional (anti-spam)."""
 import asyncio
 import logging
+import secrets
 import time
 from collections import deque
 
@@ -9,6 +10,14 @@ import aiohttp
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+# Mensaje genérico mostrado al usuario ante un error inesperado.
+UNEXPECTED_ERROR_MESSAGE = "Error inesperado, consulta los logs (ref: {ref})"
+
+
+def new_error_ref() -> str:
+    """Genera un código corto (6 caracteres) para correlacionar con el log."""
+    return secrets.token_hex(3)
 
 _WINDOW_SECONDS = 3600
 _MIN_INTERVAL_SECONDS = 60
