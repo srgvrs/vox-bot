@@ -7,6 +7,7 @@ import socket
 import subprocess
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -198,13 +199,32 @@ def _normalize_thumbnail(url: str | None) -> str | None:
     return url
 
 
+def _notify(
+    loop: asyncio.AbstractEventLoop | None,
+    on_status: Callable[[str], Awaitable[None]] | None,
+    text: str,
+) -> None:
+    """Programa el callback de estado en el loop (desde un hilo)."""
+    if loop is None or on_status is None:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(on_status(text), loop)
+    except Exception:
+        logger.debug("No se pudo programar el estado: %s", text)
+
+
 def _download_sync(
-    url: str, out_path: Path, max_bytes: int | None = None
+    url: str,
+    out_path: Path,
+    max_bytes: int | None = None,
+    loop: asyncio.AbstractEventLoop | None = None,
+    on_status: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[Path, str, float | None, int, str | None]:
     """Descarga bloqueante (se ejecuta en un hilo).
 
     Devuelve (ruta, título, duración, altura_usada, thumbnail).
     """
+    _notify(loop, on_status, "Obteniendo información del video...")
     ydl_opts = {
         "format": _build_format(),
         "merge_output_format": "mp4",
@@ -285,6 +305,7 @@ def _download_sync(
         fmt = _build_format(height)
 
     # 4) Descargar con el formato elegido (contenedor mp4).
+    _notify(loop, on_status, f"Descargando video ({height}p)...")
     with yt_dlp.YoutubeDL({**ydl_opts, "format": fmt}) as ydl:
         ydl.download([url])
 
@@ -337,7 +358,11 @@ def _map_ytdlp_error(exc: yt_dlp.utils.DownloadError) -> VideoError:
     return VideoUnavailableError("No se pudo descargar el video.")
 
 
-async def download_video(url: str, max_bytes: int | None = None) -> DownloadResult:
+async def download_video(
+    url: str,
+    max_bytes: int | None = None,
+    on_status: Callable[[str], Awaitable[None]] | None = None,
+) -> DownloadResult:
     """Descarga un video (máx. 720p) y devuelve el resultado con metadatos."""
     if not _is_safe_url(url):
         raise VideoUnavailableError("La URL no es válida o apunta a un host no permitido.")
@@ -345,11 +370,15 @@ async def download_video(url: str, max_bytes: int | None = None) -> DownloadResu
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
     out_path = settings.temp_dir / uuid.uuid4().hex
 
+    if on_status is not None:
+        await on_status("Buscando video...")
+
     start = time.perf_counter()
+    loop = asyncio.get_running_loop()
     async with _semaphore:
         try:
             path, title, duration, height, thumbnail = await asyncio.to_thread(
-                _download_sync, url, out_path, max_bytes
+                _download_sync, url, out_path, max_bytes, loop, on_status
             )
         except VideoError:
             raise
@@ -483,10 +512,14 @@ async def recompress_video(
     result: DownloadResult,
     target_bytes: int,
     original_height: int | None = None,
+    on_status: Callable[[str], Awaitable[None]] | None = None,
 ) -> DownloadResult:
     """Recomprime el video para intentar que quepa en target_bytes."""
     if not result.duration or result.duration <= 0:
         raise RecompressError("No se conoce la duración; no se puede recomprimir.")
+
+    if on_status is not None:
+        await on_status("Comprimiendo video para que quepa en Discord...")
 
     dst = result.path.with_name(f"{result.path.stem}_rc.mp4")
     start = time.perf_counter()

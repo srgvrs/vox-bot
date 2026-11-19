@@ -56,7 +56,7 @@ class Video(commands.Cog):
             )
             return
 
-        await interaction.response.defer()
+        await interaction.response.send_message("Buscando video...")
 
         guild_limit = interaction.guild.filesize_limit if interaction.guild else 0
         config_limit = settings.upload_limit_mb * 1024 * 1024
@@ -65,7 +65,11 @@ class Video(commands.Cog):
         result: DownloadResult | None = None
         recompressed: DownloadResult | None = None
         try:
-            result = await download_video(url, max_bytes=max_bytes)
+            result = await download_video(
+                url,
+                max_bytes=max_bytes,
+                on_status=lambda text: self._status(interaction, text),
+            )
             logger.info("Descarga OK: %s (%d bytes)", result.title, result.size)
 
             # 1) Intentar adjunto directo.
@@ -89,7 +93,11 @@ class Video(commands.Cog):
                         return
             elif ffmpeg_available() and result.duration:
                 try:
-                    recompressed = await recompress_video(result, max_bytes)
+                    recompressed = await recompress_video(
+                        result,
+                        max_bytes,
+                        on_status=lambda text: self._status(interaction, text),
+                    )
                     logger.info(
                         "Recompresión OK: %d bytes (antes %d)",
                         recompressed.size,
@@ -107,33 +115,51 @@ class Video(commands.Cog):
             await self._send_external(interaction, recompressed or result)
 
         except VideoTooLongError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
+            await self._fail(interaction, str(exc))
         except VideoRestrictedError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
+            await self._fail(interaction, str(exc))
         except VideoUnsupportedError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
+            await self._fail(interaction, str(exc))
         except VideoNetworkError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
+            await self._fail(interaction, str(exc))
         except VideoUnavailableError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
+            await self._fail(interaction, str(exc))
         except VideoError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
+            await self._fail(interaction, str(exc))
         except asyncio.TimeoutError:
             logger.exception("Timeout en /video")
-            await interaction.followup.send(
-                "Se agotó el tiempo de espera al procesar el video.",
-                ephemeral=True,
+            await self._fail(
+                interaction, "Se agotó el tiempo de espera al procesar el video."
             )
         except Exception as exc:
             logger.exception("Error inesperado en /video")
-            await interaction.followup.send(
+            await self._fail(
+                interaction,
                 f"Error inesperado: {type(exc).__name__}: {str(exc)[:200]}",
-                ephemeral=True,
             )
         finally:
             for item in (result, recompressed):
                 if item is not None:
                     item.path.unlink(missing_ok=True)
+
+    async def _status(self, interaction: discord.Interaction, texto: str) -> None:
+        """Edita el mensaje de estado; ignora fallos para no romper el flujo."""
+        try:
+            await interaction.edit_original_response(content=texto)
+            logger.debug("Estado: %s", texto)
+        except (discord.HTTPException, discord.NotFound) as exc:
+            logger.debug("No se pudo actualizar el estado (%s): %s", texto, exc)
+
+    async def _fail(self, interaction: discord.Interaction, mensaje: str) -> None:
+        """Borra el mensaje de estado y responde con un error ephemeral."""
+        try:
+            await interaction.delete_original_response()
+        except (discord.HTTPException, discord.NotFound) as exc:
+            logger.debug("No se pudo borrar el mensaje de estado: %s", exc)
+        try:
+            await interaction.followup.send(mensaje, ephemeral=True)
+        except discord.HTTPException:
+            logger.exception("No se pudo enviar el mensaje de error")
 
     async def _try_send_attachment(
         self,
@@ -145,10 +171,13 @@ class Video(commands.Cog):
         origen = "Adjunto (recomprimido)" if recompressed else "Adjunto"
         embed = discord.Embed(title=(result.title or "Video")[:256])
         embed.set_footer(text=origen)
+        await self._status(interaction, "Enviando...")
         start = time.perf_counter()
         try:
-            await interaction.followup.send(
-                embed=embed, file=discord.File(result.path)
+            await interaction.edit_original_response(
+                content=None,
+                embed=embed,
+                attachments=[discord.File(result.path)],
             )
             logger.info(
                 "Enviado como %s en %.2f s: %s",
@@ -164,9 +193,9 @@ class Video(commands.Cog):
                 )
                 return False
             logger.exception("HTTPException al enviar adjunto")
-            await interaction.followup.send(
+            await self._fail(
+                interaction,
                 f"Discord rechazó el archivo: {exc.status} ({exc.text or 'sin detalle'})",
-                ephemeral=True,
             )
             return True
 
@@ -175,20 +204,24 @@ class Video(commands.Cog):
     ) -> None:
         """Sube a un host externo y envía el enlace."""
         if not _upload_limiter.is_allowed(interaction.user.id):
-            await interaction.followup.send(
+            await self._fail(
+                interaction,
                 "Alcanzaste el límite diario de subidas externas. Intenta de nuevo mañana.",
-                ephemeral=True,
             )
             return
 
+        await self._status(
+            interaction,
+            "El video es muy grande para Discord, se subirá a un host externo "
+            "(puede tardar un poco)...",
+        )
         start = time.perf_counter()
         try:
             upload: UploadResult = await _storage_chain.upload(result.path)
         except StorageError as exc:
             logger.exception("Fallo de StorageChain")
-            await interaction.followup.send(
-                f"No se pudo subir el video: {str(exc)[:300]}",
-                ephemeral=True,
+            await self._fail(
+                interaction, f"No se pudo subir el video: {str(exc)[:300]}"
             )
             return
 
@@ -211,10 +244,15 @@ class Video(commands.Cog):
         embed.set_footer(
             text=f"{origen} (caduca en {upload.expiry_hours} h) · {size_mb:.1f} MB"
         )
-        await interaction.followup.send(
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        await self._status(interaction, "Enviando...")
+        try:
+            await interaction.edit_original_response(
+                content=None,
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.HTTPException, discord.NotFound) as exc:
+            logger.warning("No se pudo editar el mensaje final: %s", exc)
         logger.info("Enviado como %s: %s", origen, result.title)
 
 
