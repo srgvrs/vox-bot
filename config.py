@@ -27,6 +27,7 @@ class Settings:
     max_video_minutes: int = _int("MAX_VIDEO_MINUTES", 15)
     recompress_max_minutes: int = _int("RECOMPRESS_MAX_MINUTES", 3)
     instagram_long_reel_seconds: int = _int("INSTAGRAM_LONG_REEL_SECONDS", 60)
+    video_cooldown_seconds: int = _int("VIDEO_COOLDOWN_SECONDS", 30)
     upload_limit_mb: int = _int("DISCORD_UPLOAD_LIMIT_MB", 10)
     max_concurrent_downloads: int = _int("MAX_CONCURRENT_DOWNLOADS", 2)
     max_uploads_per_user_day: int = _int("MAX_UPLOADS_PER_USER_DAY", 10)

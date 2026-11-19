@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import time
+from collections import defaultdict
 
 import discord
 from discord import app_commands
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 _upload_limiter = DailyUserLimiter(settings.max_uploads_per_user_day)
 _storage_chain = StorageChain()
+_cooldowns: dict[int, float] = defaultdict(float)
 
 
 def _is_allowed(interaction: discord.Interaction) -> bool:
@@ -57,6 +59,18 @@ class Video(commands.Cog):
                 ephemeral=True,
             )
             return
+
+        now = time.monotonic()
+        remaining = settings.video_cooldown_seconds - (
+            now - _cooldowns[interaction.user.id]
+        )
+        if remaining > 0:
+            await interaction.response.send_message(
+                f"Espera {int(remaining) + 1} s para usar /video de nuevo",
+                ephemeral=True,
+            )
+            return
+        _cooldowns[interaction.user.id] = now
 
         await interaction.response.send_message("Buscando video...")
         status = StatusMessage(interaction)

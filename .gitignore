@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 temp/*
 !temp/.gitkeep
+logs/
 .aider*
 !.aider.conf.yml
 
