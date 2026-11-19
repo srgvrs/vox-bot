@@ -49,7 +49,11 @@ class MediaBot(commands.Bot):
 
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     if not settings.discord_token:
         raise SystemExit("Falta DISCORD_TOKEN en el archivo .env")
     async with MediaBot() as bot:

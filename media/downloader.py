@@ -5,6 +5,7 @@ import logging
 import shutil
 import socket
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,7 +93,17 @@ def _build_format() -> str:
     )
 
 
-def _download_sync(url: str, out_path: Path) -> tuple[Path, str, float | None]:
+def _build_small_format(max_bytes: int) -> str:
+    """Formato que ya debería caber en max_bytes (evita recomprimir)."""
+    return (
+        f"bv*[height<=480][filesize_approx<{max_bytes}]+ba"
+        f"/b[height<=480][filesize_approx<{max_bytes}]"
+    )
+
+
+def _download_sync(
+    url: str, out_path: Path, max_bytes: int | None = None
+) -> tuple[Path, str, float | None]:
     """Descarga bloqueante (se ejecuta en un hilo). Devuelve (ruta, título, duración)."""
     ydl_opts = {
         "format": _build_format(),
@@ -101,6 +112,7 @@ def _download_sync(url: str, out_path: Path) -> tuple[Path, str, float | None]:
         "outtmpl": str(out_path.with_suffix(".%(ext)s")),
         "quiet": True,
         "no_warnings": True,
+        "concurrent_fragment_downloads": 8,
         "logger": _YdlLogger(),
     }
 
@@ -116,7 +128,22 @@ def _download_sync(url: str, out_path: Path) -> tuple[Path, str, float | None]:
             f"El video dura más de {settings.max_video_minutes} minutos."
         )
 
-    # 2) Descargar.
+    # 2) Intentar un formato que ya quepa en max_bytes (evita recomprimir).
+    if max_bytes:
+        small_opts = {**ydl_opts, "format": _build_small_format(max_bytes)}
+        try:
+            with yt_dlp.YoutubeDL(small_opts) as ydl:
+                ydl.download([url])
+            candidates = list(out_path.parent.glob(f"{out_path.stem}.*"))
+            if candidates and candidates[0].stat().st_size <= max_bytes:
+                logger.info("Descarga con formato pre-ajustado (<= %d bytes)", max_bytes)
+                return candidates[0], title, duration
+            for c in candidates:
+                c.unlink(missing_ok=True)
+        except yt_dlp.utils.DownloadError:
+            logger.info("No hay formato pre-ajustado; se usa el flujo normal.")
+
+    # 3) Descargar con el formato normal.
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
@@ -165,7 +192,7 @@ def _map_ytdlp_error(exc: yt_dlp.utils.DownloadError) -> VideoError:
     return VideoUnavailableError("No se pudo descargar el video.")
 
 
-async def download_video(url: str) -> DownloadResult:
+async def download_video(url: str, max_bytes: int | None = None) -> DownloadResult:
     """Descarga un video (máx. 720p) y devuelve el resultado con metadatos."""
     if not _is_safe_url(url):
         raise VideoUnavailableError("La URL no es válida o apunta a un host no permitido.")
@@ -173,15 +200,17 @@ async def download_video(url: str) -> DownloadResult:
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
     out_path = settings.temp_dir / uuid.uuid4().hex
 
+    start = time.perf_counter()
     async with _semaphore:
         try:
             path, title, duration = await asyncio.to_thread(
-                _download_sync, url, out_path
+                _download_sync, url, out_path, max_bytes
             )
         except VideoError:
             raise
         except yt_dlp.utils.DownloadError as exc:
             raise _map_ytdlp_error(exc) from exc
+    logger.info("Descarga completada en %.2f s", time.perf_counter() - start)
 
     size = path.stat().st_size
     return DownloadResult(
@@ -191,6 +220,31 @@ async def download_video(url: str) -> DownloadResult:
         duration=duration,
         size=size,
     )
+
+
+_qsv_available: bool | None = None
+
+
+def _has_qsv() -> bool:
+    """Detecta h264_qsv una sola vez y lo cachea."""
+    global _qsv_available
+    if _qsv_available is not None:
+        return _qsv_available
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        _qsv_available = False
+        return False
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        _qsv_available = "h264_qsv" in (proc.stdout or "")
+    except Exception:
+        _qsv_available = False
+    return _qsv_available
 
 
 def _pick_height(video_kbps: int, original_height: int | None) -> int:
@@ -235,35 +289,47 @@ def _recompress_sync(
         height,
     )
 
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-i",
-        str(src),
-        "-vf",
-        f"scale=-2:{height}",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-b:v",
-        f"{video_kbps}k",
-        "-maxrate",
-        f"{video_kbps}k",
-        "-bufsize",
-        f"{video_kbps * 2}k",
-        "-c:a",
-        "aac",
-        "-b:a",
-        f"{audio_kbps}k",
-        "-movflags",
-        "+faststart",
-        str(dst),
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        tail = (proc.stderr or "").strip().splitlines()[-1:] or ["error desconocido"]
-        raise RecompressError(f"Falló la recompresión: {tail[0][:200]}")
+    def _run(encoder: str, extra: list[str]) -> bool:
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(src),
+            "-vf",
+            f"scale=-2:{height}",
+            "-c:v",
+            encoder,
+            *extra,
+            "-b:v",
+            f"{video_kbps}k",
+            "-maxrate",
+            f"{video_kbps}k",
+            "-bufsize",
+            f"{video_kbps * 2}k",
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{audio_kbps}k",
+            "-movflags",
+            "+faststart",
+            str(dst),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail = (proc.stderr or "").strip().splitlines()[-1:] or ["error desconocido"]
+            logger.warning("Encoder %s falló: %s", encoder, tail[0][:200])
+            return False
+        return dst.exists() and dst.stat().st_size > 0
+
+    if _has_qsv():
+        logger.info("Recompresión usando encoder h264_qsv")
+        if _run("h264_qsv", []):
+            return
+        logger.info("h264_qsv falló; reintentando con libx264")
+
+    logger.info("Recompresión usando encoder libx264")
+    if not _run("libx264", ["-preset", "veryfast"]):
+        raise RecompressError("Falló la recompresión con libx264.")
 
 
 async def recompress_video(
@@ -276,6 +342,7 @@ async def recompress_video(
         raise RecompressError("No se conoce la duración; no se puede recomprimir.")
 
     dst = result.path.with_name(f"{result.path.stem}_rc.mp4")
+    start = time.perf_counter()
     try:
         await asyncio.to_thread(
             _recompress_sync,
@@ -289,6 +356,7 @@ async def recompress_video(
         raise
     except Exception as exc:
         raise RecompressError(f"Falló la recompresión: {exc}") from exc
+    logger.info("Recompresión completada en %.2f s", time.perf_counter() - start)
 
     if not dst.exists():
         raise RecompressError("Falló la recompresión: no se generó el archivo.")

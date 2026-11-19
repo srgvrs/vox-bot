@@ -1,6 +1,7 @@
 """Cog de descarga de video: /video (adjunto o link)."""
 import asyncio
 import logging
+import time
 
 import discord
 from discord import app_commands
@@ -64,7 +65,7 @@ class Video(commands.Cog):
         result: DownloadResult | None = None
         recompressed: DownloadResult | None = None
         try:
-            result = await download_video(url)
+            result = await download_video(url, max_bytes=max_bytes)
             logger.info("Descarga OK: %s (%d bytes)", result.title, result.size)
 
             # 1) Intentar adjunto directo.
@@ -138,11 +139,17 @@ class Video(commands.Cog):
         origen = "Adjunto (recomprimido)" if recompressed else "Adjunto"
         embed = discord.Embed(title=(result.title or "Video")[:256])
         embed.set_footer(text=origen)
+        start = time.perf_counter()
         try:
             await interaction.followup.send(
                 embed=embed, file=discord.File(result.path)
             )
-            logger.info("Enviado como %s: %s", origen, result.title)
+            logger.info(
+                "Enviado como %s en %.2f s: %s",
+                origen,
+                time.perf_counter() - start,
+                result.title,
+            )
             return True
         except discord.HTTPException as exc:
             if exc.status == 413 or getattr(exc, "code", None) == 40005:
@@ -168,6 +175,7 @@ class Video(commands.Cog):
             )
             return
 
+        start = time.perf_counter()
         try:
             upload: UploadResult = await _storage_chain.upload(result.path)
         except StorageError as exc:
@@ -179,6 +187,11 @@ class Video(commands.Cog):
             return
 
         _upload_limiter.consume(interaction.user.id)
+        logger.info(
+            "Subida externa completada en %.2f s (%s)",
+            time.perf_counter() - start,
+            upload.provider,
+        )
 
         origen = f"Subido a {upload.provider}"
         footer = f"{origen} (el enlace caduca en {upload.expiry_hours} h)"
