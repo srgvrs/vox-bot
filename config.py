@@ -25,6 +25,7 @@ class Settings:
     max_video_minutes: int = _int("MAX_VIDEO_MINUTES", 15)
     upload_limit_mb: int = _int("DISCORD_UPLOAD_LIMIT_MB", 10)
     max_concurrent_downloads: int = _int("MAX_CONCURRENT_DOWNLOADS", 2)
+    max_uploads_per_user_day: int = _int("MAX_UPLOADS_PER_USER_DAY", 10)
     temp_dir: Path = Path(os.getenv("TEMP_DIR", "temp"))
 
     # Cloudflare R2 (API compatible con S3)

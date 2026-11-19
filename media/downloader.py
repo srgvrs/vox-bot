@@ -25,9 +25,6 @@ class VideoTooLongError(VideoError):
     """El video supera la duración máxima permitida."""
 
 
-class VideoTooLargeError(VideoError):
-    """El archivo descargado supera el tamaño máximo permitido."""
-
 
 class VideoUnavailableError(VideoError):
     """El video es privado, no está disponible o la URL no es válida."""
@@ -138,11 +135,6 @@ async def download_video(url: str, max_bytes: int) -> Path:
                 "No se pudo descargar el video."
             ) from exc
 
-    if path.stat().st_size > max_bytes:
-        path.unlink(missing_ok=True)
-        raise VideoTooLargeError(
-            "El archivo es demasiado grande para enviarlo como adjunto."
-        )
     return path
 
 

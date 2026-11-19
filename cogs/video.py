@@ -8,14 +8,16 @@ from discord.ext import commands
 from config import settings
 from media.downloader import (
     VideoError,
-    VideoTooLargeError,
     VideoTooLongError,
     VideoUnavailableError,
     download_video,
     ffmpeg_available,
 )
+from utils.ratelimit import DailyUserLimiter
 
 logger = logging.getLogger(__name__)
+
+_upload_limiter = DailyUserLimiter(settings.max_uploads_per_user_day)
 
 
 def _is_allowed(interaction: discord.Interaction) -> bool:
@@ -53,10 +55,14 @@ class Video(commands.Cog):
         path = None
         try:
             path = await download_video(url, max_bytes)
+            if not _upload_limiter.consume(interaction.user.id):
+                await interaction.followup.send(
+                    "Alcanzaste el límite diario de subidas. Intenta de nuevo mañana.",
+                    ephemeral=True,
+                )
+                return
             await interaction.followup.send(file=discord.File(path))
         except VideoTooLongError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
-        except VideoTooLargeError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
         except VideoUnavailableError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
