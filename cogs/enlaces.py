@@ -77,8 +77,26 @@ class Enlaces(commands.Cog):
             return
 
         guild_limit = message.guild.filesize_limit if message.guild else 0
-        config_limit = settings.upload_limit_mb * 1024 * 1024
-        max_bytes = min(guild_limit, config_limit) if guild_limit else config_limit
+        env_limit_mb = settings.discord_upload_limit_mb
+        # DISCORD_UPLOAD_LIMIT_MB definido en .env => override (gana siempre).
+        # No definido => se usa el límite del servidor (guild.filesize_limit).
+        if env_limit_mb is not None:
+            max_bytes = env_limit_mb * 1024 * 1024
+            origen_limite = ".env"
+        elif guild_limit:
+            max_bytes = guild_limit
+            origen_limite = "servidor"
+        else:
+            max_bytes = settings.upload_limit_mb * 1024 * 1024
+            origen_limite = "default"
+        logger.info(
+            "Límite de adjunto (enlaces): guild.filesize_limit=%d bytes, "
+            "DISCORD_UPLOAD_LIMIT_MB=%s, final=%d bytes (origen=%s)",
+            guild_limit,
+            f"{env_limit_mb} MB" if env_limit_mb is not None else "no definido",
+            max_bytes,
+            origen_limite,
+        )
 
         responder = MessageResponder(message)
         await run_video_flow(
