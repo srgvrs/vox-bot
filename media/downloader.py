@@ -102,6 +102,91 @@ def _build_small_format(max_bytes: int) -> str:
     )
 
 
+def _estimate_size(fmt: dict, duration: float | None) -> int | None:
+    """Estima el tamaño de un formato en bytes (filesize, approx o tbr*duración)."""
+    size = fmt.get("filesize")
+    if isinstance(size, (int, float)) and size > 0:
+        return int(size)
+    approx = fmt.get("filesize_approx")
+    if isinstance(approx, (int, float)) and approx > 0:
+        return int(approx)
+    tbr = fmt.get("tbr")
+    if isinstance(tbr, (int, float)) and tbr > 0 and duration and duration > 0:
+        return int(tbr * duration * 125)
+    return None
+
+
+def _pick_host_formats(
+    info: dict, duration: float | None, max_bytes: int
+) -> tuple[dict, dict, int, int] | None:
+    """Elige (video, audio, altura, tamaño_estimado) para host externo.
+
+    Devuelve None si no hay formatos utilizables.
+    """
+    formats = info.get("formats") or []
+    videos = [
+        f
+        for f in formats
+        if f.get("vcodec") not in (None, "none")
+        and isinstance(f.get("height"), int)
+        and f["height"] > 0
+        and f["height"] <= settings.host_video_height
+    ]
+    audios = [
+        f
+        for f in formats
+        if f.get("acodec") not in (None, "none")
+        and f.get("vcodec") in (None, "none")
+    ]
+    if not videos:
+        return None
+
+    # Audio más ligero con abr >= 96 (si no hay, el más ligero disponible).
+    def _audio_size(f: dict) -> int:
+        return _estimate_size(f, duration) or 0
+
+    audio_candidates = [
+        f for f in audios if isinstance(f.get("abr"), (int, float)) and f["abr"] >= 96
+    ]
+    if not audio_candidates:
+        audio_candidates = audios
+    audio = min(audio_candidates, key=_audio_size) if audio_candidates else None
+    audio_size = _audio_size(audio) if audio else 0
+
+    # Preferir códec avc1 si existe, luego ordenar por altura descendente.
+    def _video_key(f: dict) -> tuple[int, int]:
+        is_avc = 1 if str(f.get("vcodec", "")).startswith("avc1") else 0
+        return (is_avc, f["height"])
+
+    videos_sorted = sorted(videos, key=_video_key, reverse=True)
+
+    chosen: dict | None = None
+    chosen_size = 0
+    for f in videos_sorted:
+        v_size = _estimate_size(f, duration)
+        if v_size is None:
+            continue
+        total = int((v_size + audio_size) * 1.05)
+        if total <= max_bytes:
+            chosen = f
+            chosen_size = total
+            break
+
+    if chosen is None:
+        # Ninguno cabe: usar el de menor altura disponible.
+        chosen = min(videos, key=lambda f: f["height"])
+        v_size = _estimate_size(chosen, duration) or 0
+        chosen_size = int((v_size + audio_size) * 1.05)
+        logger.warning(
+            "Ningún formato cabe en HOST_MAX_MB=%d; se usa el de menor altura (%dp, ~%d bytes)",
+            settings.host_max_mb,
+            chosen["height"],
+            chosen_size,
+        )
+
+    return chosen, audio, chosen["height"], chosen_size
+
+
 def _download_sync(
     url: str, out_path: Path, max_bytes: int | None = None
 ) -> tuple[Path, str, float | None, int]:
@@ -151,15 +236,33 @@ def _download_sync(
             logger.info("No hay formato pre-ajustado; se usa el flujo normal.")
 
     # 3) Elegir altura según destino: si va a host externo (duración > límite de
-    #    recompresión), usar HOST_VIDEO_HEIGHT; si no, MAX_VIDEO_HEIGHT.
+    #    recompresión), usar HOST_VIDEO_HEIGHT con tope HOST_MAX_MB; si no,
+    #    MAX_VIDEO_HEIGHT.
     duration_min = (duration or 0) / 60
     if duration_min > settings.recompress_max_minutes:
-        height = settings.host_video_height
-        logger.info(
-            "Altura elegida: %dp (destino host externo, duración %.1f min)",
-            height,
-            duration_min,
-        )
+        host_max_bytes = settings.host_max_mb * 1024 * 1024
+        picked = _pick_host_formats(info, duration, host_max_bytes)
+        if picked is None:
+            height = settings.host_video_height
+            logger.info(
+                "Altura elegida: %dp (destino host externo, sin formatos; duración %.1f min)",
+                height,
+                duration_min,
+            )
+            fmt = _build_format(height)
+        else:
+            video_fmt, audio_fmt, height, est_size = picked
+            logger.info(
+                "Altura elegida: %dp (destino host externo, duración %.1f min, "
+                "tamaño estimado ~%d bytes)",
+                height,
+                duration_min,
+                est_size,
+            )
+            if audio_fmt is not None:
+                fmt = f"{video_fmt['format_id']}+{audio_fmt['format_id']}"
+            else:
+                fmt = video_fmt["format_id"]
     else:
         height = settings.max_video_height
         logger.info(
@@ -167,16 +270,21 @@ def _download_sync(
             height,
             duration_min,
         )
+        fmt = _build_format(height)
 
-    # 4) Descargar con el formato normal.
-    with yt_dlp.YoutubeDL({**ydl_opts, "format": _build_format(height)}) as ydl:
+    # 4) Descargar con el formato elegido (contenedor mp4).
+    with yt_dlp.YoutubeDL({**ydl_opts, "format": fmt}) as ydl:
         ydl.download([url])
 
     # 5) Localizar el archivo final (la extensión puede variar tras el merge).
     candidates = list(out_path.parent.glob(f"{out_path.stem}.*"))
     if not candidates:
         raise VideoUnavailableError("No se pudo descargar el video.")
-    return candidates[0], title, duration, height
+    final_path = candidates[0]
+    logger.info(
+        "Tamaño real final: %d bytes (altura %dp)", final_path.stat().st_size, height
+    )
+    return final_path, title, duration, height
 
 
 class _YdlLogger:
