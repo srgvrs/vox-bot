@@ -4,4 +4,4 @@ certifi
 python-dotenv
 yt-dlp[default,curl-cffi]
 ddgs
-boto3
+imageio-ffmpeg
