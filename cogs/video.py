@@ -320,7 +320,16 @@ async def run_video_flow(
             except RecompressError as exc:
                 logger.warning("Recompresión fallida: %s", exc)
 
-        # 3) Subida externa.
+        # 3) Subida externa. Si el recomprimido no cabe, se sube el ORIGINAL.
+        if recompressed is not None and recompressed.size > max_bytes:
+            logger.info(
+                "El recomprimido (%d bytes) no cabe en %d; se sube el original (%d bytes).",
+                recompressed.size,
+                max_bytes,
+                result.size,
+            )
+            recompressed.path.unlink(missing_ok=True)
+            recompressed = None
         final = recompressed or result
         if not _upload_limiter.is_allowed(user_id):
             await responder.send_error(

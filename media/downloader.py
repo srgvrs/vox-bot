@@ -700,16 +700,31 @@ def _recompress_sync(
     target_bytes: int,
     duration: float,
     original_height: int | None = None,
-) -> None:
-    """Recomprime a un bitrate objetivo (una sola pasada)."""
+    force_encoder: str | None = None,
+    force_video_kbps: int | None = None,
+) -> int:
+    """Recomprime a un bitrate objetivo (una sola pasada).
+
+    Devuelve el bitrate de video usado (kbps). Si force_encoder es "libx264",
+    se salta la detección de QSV y se usa libx264 con el bitrate indicado.
+    """
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RecompressError("ffmpeg no está disponible.")
 
-    # Margen de seguridad del 10% y reserva para el audio.
+    # Margen de seguridad: 20% con QSV (menos preciso), 10% con libx264.
+    use_qsv = force_encoder is None and _has_qsv()
+    margin = 0.80 if use_qsv else 0.90
+
     audio_kbps = 64
-    total_kbps = max(int((target_bytes * 8 * 0.9) / duration / 1000), audio_kbps + 50)
-    video_kbps = total_kbps - audio_kbps
+    if force_video_kbps is not None:
+        video_kbps = max(int(force_video_kbps), 50)
+        total_kbps = video_kbps + audio_kbps
+    else:
+        total_kbps = max(
+            int((target_bytes * 8 * margin) / duration / 1000), audio_kbps + 50
+        )
+        video_kbps = total_kbps - audio_kbps
     if video_kbps >= 400:
         audio_kbps = 96
         total_kbps = max(total_kbps, audio_kbps + 50)
@@ -717,10 +732,11 @@ def _recompress_sync(
 
     height = _pick_height(video_kbps, original_height)
     logger.info(
-        "Recompresión: bitrate video=%d kbps, audio=%d kbps, altura=%dp",
+        "Recompresión: bitrate video=%d kbps, audio=%d kbps, altura=%dp, margen=%.0f%%",
         video_kbps,
         audio_kbps,
         height,
+        margin * 100,
     )
 
     def _run(encoder: str, extra: list[str]) -> bool:
@@ -755,15 +771,16 @@ def _recompress_sync(
             return False
         return dst.exists() and dst.stat().st_size > 0
 
-    if _has_qsv():
+    if use_qsv:
         logger.info("Recompresión usando encoder h264_qsv")
         if _run("h264_qsv", []):
-            return
+            return video_kbps
         logger.info("h264_qsv falló; reintentando con libx264")
 
     logger.info("Recompresión usando encoder libx264")
     if not _run("libx264", ["-preset", "veryfast"]):
         raise RecompressError("Falló la recompresión con libx264.")
+    return video_kbps
 
 
 async def recompress_video(
@@ -772,7 +789,11 @@ async def recompress_video(
     original_height: int | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
 ) -> DownloadResult:
-    """Recomprime el video para intentar que quepa en target_bytes."""
+    """Recomprime el video para intentar que quepa en target_bytes.
+
+    Si el primer intento se pasa del límite por menos del 25%, reintenta una
+    vez con libx264 -preset veryfast y un bitrate ajustado al tamaño real.
+    """
     if not result.duration or result.duration <= 0:
         raise RecompressError("No se conoce la duración; no se puede recomprimir.")
 
@@ -782,7 +803,7 @@ async def recompress_video(
     dst = result.path.with_name(f"{result.path.stem}_rc.mp4")
     start = time.perf_counter()
     try:
-        await asyncio.to_thread(
+        video_kbps = await asyncio.to_thread(
             _recompress_sync,
             result.path,
             dst,
@@ -794,10 +815,53 @@ async def recompress_video(
         raise
     except Exception as exc:
         raise RecompressError(f"Falló la recompresión: {exc}") from exc
-    logger.info("Recompresión completada en %.2f s", time.perf_counter() - start)
 
     if not dst.exists():
         raise RecompressError("Falló la recompresión: no se generó el archivo.")
+
+    real_size = dst.stat().st_size
+    logger.info(
+        "Recompresión intento 1: estimado<=%d bytes, real=%d bytes (encoder inicial)",
+        target_bytes,
+        real_size,
+    )
+
+    # Reintento si se pasa por menos del 25% del límite.
+    if real_size > target_bytes and real_size <= target_bytes * 1.25:
+        new_kbps = max(int(video_kbps * (target_bytes * 0.93 / real_size)), 50)
+        logger.info(
+            "Recompresión intento 2 con libx264: bitrate %d -> %d kbps "
+            "(real %d > límite %d, dentro del 25%%)",
+            video_kbps,
+            new_kbps,
+            real_size,
+            target_bytes,
+        )
+        try:
+            await asyncio.to_thread(
+                _recompress_sync,
+                result.path,
+                dst,
+                target_bytes,
+                result.duration,
+                original_height,
+                "libx264",
+                new_kbps,
+            )
+        except RecompressError as exc:
+            logger.warning("Reintento de recompresión falló: %s", exc)
+        else:
+            if dst.exists():
+                real_size = dst.stat().st_size
+                logger.info(
+                    "Recompresión intento 2: estimado<=%d bytes, real=%d bytes "
+                    "(encoder libx264, bitrate %d kbps)",
+                    target_bytes,
+                    real_size,
+                    new_kbps,
+                )
+
+    logger.info("Recompresión completada en %.2f s", time.perf_counter() - start)
 
     return DownloadResult(
         path=dst,
