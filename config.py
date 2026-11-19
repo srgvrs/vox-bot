@@ -69,6 +69,14 @@ class Settings:
     )
     serper_daily_limit: int = _int("SERPER_DAILY_LIMIT", 50)
 
+    # Administración / monitoreo
+    admin_user_ids: tuple[int, ...] = tuple(
+        int(x)
+        for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",")
+        if x.isdigit()
+    )
+    error_webhook_url: str = os.getenv("ERROR_WEBHOOK_URL", "")
+
     # Estado animado de /video (formato <a:nombre:id> o vacío para spinner)
     status_emoji: str = os.getenv("STATUS_EMOJI", "")
 

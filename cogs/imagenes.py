@@ -15,6 +15,7 @@ from search.chain import SearchChain
 from search.ddg import DuckDuckGoProvider
 from search.serper import SerperProvider
 from utils.cache import TTLCache, normalize_query
+from utils.errors import report_error
 
 logger = logging.getLogger(__name__)
 
@@ -193,8 +194,9 @@ class Imagenes(commands.Cog):
         else:
             try:
                 results, provider_name = await self.chain.search(consulta, limit=100)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Fallo la búsqueda de imágenes para %r", consulta)
+                await report_error("img", exc)
                 await interaction.followup.send(
                     "No pude completar la búsqueda de imágenes. Intenta de nuevo en un momento.",
                     ephemeral=True,

@@ -26,6 +26,7 @@ from media.downloader import (
     recompress_video,
 )
 from media.storage import StorageChain, StorageError, UploadResult
+from utils.errors import report_error
 from utils.ratelimit import DailyUserLimiter
 from utils.status import StatusMessage
 
@@ -371,13 +372,15 @@ async def run_video_flow(
         await responder.send_error(str(exc))
     except VideoError as exc:
         await responder.send_error(str(exc))
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as exc:
         logger.exception("Timeout en /video")
+        await report_error("video", exc)
         await responder.send_error(
             "Se agotó el tiempo de espera al procesar el video."
         )
     except Exception as exc:
         logger.exception("Error inesperado en /video")
+        await report_error("video", exc)
         await responder.send_error(
             f"Error inesperado: {type(exc).__name__}: {str(exc)[:200]}"
         )
