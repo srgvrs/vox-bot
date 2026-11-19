@@ -22,6 +22,7 @@ class Settings:
 
     # Video
     max_video_height: int = _int("MAX_VIDEO_HEIGHT", 720)
+    host_video_height: int = _int("HOST_VIDEO_HEIGHT", 480)
     max_video_minutes: int = _int("MAX_VIDEO_MINUTES", 15)
     recompress_max_minutes: int = _int("RECOMPRESS_MAX_MINUTES", 3)
     upload_limit_mb: int = _int("DISCORD_UPLOAD_LIMIT_MB", 10)

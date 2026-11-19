@@ -81,6 +81,12 @@ class Video(commands.Cog):
                     duration_min,
                     settings.recompress_max_minutes,
                 )
+                # Si el archivo de HOST_VIDEO_HEIGHT cabe como adjunto, enviarlo.
+                if result.size <= max_bytes:
+                    if await self._try_send_attachment(
+                        interaction, result, recompressed=False
+                    ):
+                        return
             elif ffmpeg_available() and result.duration:
                 try:
                     recompressed = await recompress_video(result, max_bytes)

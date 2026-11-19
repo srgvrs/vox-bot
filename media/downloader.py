@@ -58,6 +58,7 @@ class DownloadResult:
     recompressed: bool
     duration: float | None
     size: int
+    height: int | None = None
 
 
 def _is_safe_url(url: str) -> bool:
@@ -85,8 +86,8 @@ def _is_safe_url(url: str) -> bool:
     return True
 
 
-def _build_format() -> str:
-    height = settings.max_video_height
+def _build_format(height: int | None = None) -> str:
+    height = height or settings.max_video_height
     return (
         f"bv*[height<={height}][vcodec^=avc1]+ba[acodec^=mp4a]"
         f"/b[height<={height}]/b"
@@ -103,8 +104,11 @@ def _build_small_format(max_bytes: int) -> str:
 
 def _download_sync(
     url: str, out_path: Path, max_bytes: int | None = None
-) -> tuple[Path, str, float | None]:
-    """Descarga bloqueante (se ejecuta en un hilo). Devuelve (ruta, título, duración)."""
+) -> tuple[Path, str, float | None, int]:
+    """Descarga bloqueante (se ejecuta en un hilo).
+
+    Devuelve (ruta, título, duración, altura_usada).
+    """
     ydl_opts = {
         "format": _build_format(),
         "merge_output_format": "mp4",
@@ -136,22 +140,43 @@ def _download_sync(
                 ydl.download([url])
             candidates = list(out_path.parent.glob(f"{out_path.stem}.*"))
             if candidates and candidates[0].stat().st_size <= max_bytes:
-                logger.info("Descarga con formato pre-ajustado (<= %d bytes)", max_bytes)
-                return candidates[0], title, duration
+                logger.info(
+                    "Descarga con formato pre-ajustado (<= %d bytes, altura<=480p)",
+                    max_bytes,
+                )
+                return candidates[0], title, duration, 480
             for c in candidates:
                 c.unlink(missing_ok=True)
         except yt_dlp.utils.DownloadError:
             logger.info("No hay formato pre-ajustado; se usa el flujo normal.")
 
-    # 3) Descargar con el formato normal.
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    # 3) Elegir altura según destino: si va a host externo (duración > límite de
+    #    recompresión), usar HOST_VIDEO_HEIGHT; si no, MAX_VIDEO_HEIGHT.
+    duration_min = (duration or 0) / 60
+    if duration_min > settings.recompress_max_minutes:
+        height = settings.host_video_height
+        logger.info(
+            "Altura elegida: %dp (destino host externo, duración %.1f min)",
+            height,
+            duration_min,
+        )
+    else:
+        height = settings.max_video_height
+        logger.info(
+            "Altura elegida: %dp (destino adjunto, duración %.1f min)",
+            height,
+            duration_min,
+        )
+
+    # 4) Descargar con el formato normal.
+    with yt_dlp.YoutubeDL({**ydl_opts, "format": _build_format(height)}) as ydl:
         ydl.download([url])
 
-    # 3) Localizar el archivo final (la extensión puede variar tras el merge).
+    # 5) Localizar el archivo final (la extensión puede variar tras el merge).
     candidates = list(out_path.parent.glob(f"{out_path.stem}.*"))
     if not candidates:
         raise VideoUnavailableError("No se pudo descargar el video.")
-    return candidates[0], title, duration
+    return candidates[0], title, duration, height
 
 
 class _YdlLogger:
@@ -203,7 +228,7 @@ async def download_video(url: str, max_bytes: int | None = None) -> DownloadResu
     start = time.perf_counter()
     async with _semaphore:
         try:
-            path, title, duration = await asyncio.to_thread(
+            path, title, duration, height = await asyncio.to_thread(
                 _download_sync, url, out_path, max_bytes
             )
         except VideoError:
@@ -219,6 +244,7 @@ async def download_video(url: str, max_bytes: int | None = None) -> DownloadResu
         recompressed=False,
         duration=duration,
         size=size,
+        height=height,
     )
 
 
@@ -367,6 +393,7 @@ async def recompress_video(
         recompressed=True,
         duration=result.duration,
         size=dst.stat().st_size,
+        height=result.height,
     )
 
 

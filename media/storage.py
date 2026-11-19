@@ -188,10 +188,19 @@ class StorageChain:
 
     async def upload(self, path: Path) -> UploadResult:
         """Sube el archivo al primer host que lo acepte."""
+        try:
+            return await asyncio.wait_for(self._upload_inner(path), timeout=900)
+        except asyncio.TimeoutError as exc:
+            raise StorageError("La subida externa superó el tiempo máximo (900 s).") from exc
+
+    async def _upload_inner(self, path: Path) -> UploadResult:
         size = path.stat().st_size
+        size_mb = size / (1024 * 1024)
         errors: list[str] = []
 
-        timeout = aiohttp.ClientTimeout(total=settings.storage_timeout_seconds)
+        # Timeout proporcional al tamaño: 30 s base + 6 s por MB.
+        total = 30 + int(6 * size_mb)
+        timeout = aiohttp.ClientTimeout(total=total, sock_connect=15)
         connector = aiohttp.TCPConnector(ssl=_build_ssl_context())
         async with aiohttp.ClientSession(
             timeout=timeout, connector=connector
@@ -204,35 +213,107 @@ class StorageChain:
                     errors.append(f"{provider.name}: circuit breaker abierto")
                     continue
 
-                for attempt in range(settings.storage_max_retries + 1):
+                # Máximo 1 reintento (2 intentos totales).
+                for attempt in range(2):
+                    start = time.perf_counter()
+                    logger.info(
+                        "Subida a %s: intento %d, %.2f MB",
+                        provider.name,
+                        attempt + 1,
+                        size_mb,
+                    )
                     try:
                         url = await provider.upload(session, path)
+                        elapsed = time.perf_counter() - start
                         self._record_success(provider.name)
-                        logger.info("Subida externa OK con %s", provider.name)
+                        logger.info(
+                            "Subida a %s OK: intento %d, %.2f MB, %.2f s",
+                            provider.name,
+                            attempt + 1,
+                            size_mb,
+                            elapsed,
+                        )
                         return UploadResult(
                             url=url,
                             provider=provider.name,
                             expiry_hours=provider.expiry_hours,
                         )
                     except aiohttp.ClientConnectorCertificateError as exc:
+                        elapsed = time.perf_counter() - start
                         logger.warning(
-                            "Error de certificado SSL con %s: %s",
+                            "Subida a %s falló: intento %d, %.2f MB, %.2f s, "
+                            "error de certificado SSL: %s",
                             provider.name,
+                            attempt + 1,
+                            size_mb,
+                            elapsed,
                             exc,
                         )
                         errors.append(f"{provider.name}: error de certificado SSL")
                         break
                     except asyncio.TimeoutError:
+                        elapsed = time.perf_counter() - start
+                        logger.warning(
+                            "Subida a %s falló: intento %d, %.2f MB, %.2f s, timeout",
+                            provider.name,
+                            attempt + 1,
+                            size_mb,
+                            elapsed,
+                        )
                         errors.append(f"{provider.name}: timeout")
+                    except aiohttp.ClientResponseError as exc:
+                        elapsed = time.perf_counter() - start
+                        logger.warning(
+                            "Subida a %s falló: intento %d, %.2f MB, %.2f s, "
+                            "status %d",
+                            provider.name,
+                            attempt + 1,
+                            size_mb,
+                            elapsed,
+                            exc.status,
+                        )
+                        errors.append(f"{provider.name}: HTTP {exc.status}")
+                        if exc.status < 500:
+                            break
                     except aiohttp.ClientError as exc:
+                        elapsed = time.perf_counter() - start
+                        logger.warning(
+                            "Subida a %s falló: intento %d, %.2f MB, %.2f s, %s",
+                            provider.name,
+                            attempt + 1,
+                            size_mb,
+                            elapsed,
+                            type(exc).__name__,
+                        )
                         errors.append(f"{provider.name}: {type(exc).__name__}")
+                        break
                     except StorageError as exc:
+                        elapsed = time.perf_counter() - start
+                        logger.warning(
+                            "Subida a %s falló: intento %d, %.2f MB, %.2f s, %s",
+                            provider.name,
+                            attempt + 1,
+                            size_mb,
+                            elapsed,
+                            exc,
+                        )
                         errors.append(f"{provider.name}: {exc}")
+                        break
                     except Exception as exc:
+                        elapsed = time.perf_counter() - start
+                        logger.warning(
+                            "Subida a %s falló: intento %d, %.2f MB, %.2f s, %s",
+                            provider.name,
+                            attempt + 1,
+                            size_mb,
+                            elapsed,
+                            type(exc).__name__,
+                        )
                         errors.append(f"{provider.name}: {type(exc).__name__}")
+                        break
 
-                    if attempt < settings.storage_max_retries:
-                        await asyncio.sleep(1 + attempt)
+                    if attempt == 0:
+                        await asyncio.sleep(1)
 
                 self._record_failure(provider.name)
 
