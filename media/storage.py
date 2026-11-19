@@ -1,15 +1,22 @@
 """Subida a hosts externos (Litterbox, storage.to, GoFile) con cadena de fallback."""
 import asyncio
 import logging
+import ssl
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
+import certifi
 
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    """Contexto SSL basado en certifi (evita errores de certificado en Windows)."""
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 class StorageError(Exception):
@@ -185,7 +192,10 @@ class StorageChain:
         errors: list[str] = []
 
         timeout = aiohttp.ClientTimeout(total=settings.storage_timeout_seconds)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        connector = aiohttp.TCPConnector(ssl=_build_ssl_context())
+        async with aiohttp.ClientSession(
+            timeout=timeout, connector=connector
+        ) as session:
             for provider in self.providers:
                 if provider.max_bytes is not None and size > provider.max_bytes:
                     errors.append(f"{provider.name}: archivo demasiado grande")
@@ -204,6 +214,14 @@ class StorageChain:
                             provider=provider.name,
                             expiry_hours=provider.expiry_hours,
                         )
+                    except aiohttp.ClientConnectorCertificateError as exc:
+                        logger.warning(
+                            "Error de certificado SSL con %s: %s",
+                            provider.name,
+                            exc,
+                        )
+                        errors.append(f"{provider.name}: error de certificado SSL")
+                        break
                     except asyncio.TimeoutError:
                         errors.append(f"{provider.name}: timeout")
                     except aiohttp.ClientError as exc:

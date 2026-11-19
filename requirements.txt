@@ -1,5 +1,6 @@
 discord.py
 aiohttp
+certifi
 python-dotenv
 yt-dlp
 ddgs
