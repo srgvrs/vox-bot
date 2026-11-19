@@ -200,11 +200,15 @@ class Video(commands.Cog):
         )
 
         origen = f"Subido a {upload.provider}"
-        footer = f"{origen} (el enlace caduca en {upload.expiry_hours} h)"
-        embed = discord.Embed(title=(result.title or "Video")[:256])
-        embed.description = upload.url
-        embed.set_footer(text=footer)
-        await interaction.followup.send(embed=embed)
+        content = (
+            f"**{(result.title or 'Video')[:256]}**\n"
+            f"{upload.url}\n"
+            f"-# {origen} (el enlace caduca en {upload.expiry_hours} h)"
+        )
+        await interaction.followup.send(
+            content=content,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         logger.info("Enviado como %s: %s", origen, result.title)
 
 
