@@ -72,8 +72,15 @@ class Video(commands.Cog):
                 if await self._try_send_attachment(interaction, result, recompressed=False):
                     return
 
-            # 2) Recomprimir una sola vez.
-            if ffmpeg_available() and result.duration:
+            # 2) Recomprimir una sola vez (si la duración lo permite).
+            duration_min = (result.duration or 0) / 60
+            if duration_min > settings.recompress_max_minutes:
+                logger.info(
+                    "Se omite la recompresión: duración %.1f min > RECOMPRESS_MAX_MINUTES=%d",
+                    duration_min,
+                    settings.recompress_max_minutes,
+                )
+            elif ffmpeg_available() and result.duration:
                 try:
                     recompressed = await recompress_video(result, max_bytes)
                     logger.info(

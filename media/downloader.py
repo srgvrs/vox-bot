@@ -193,22 +193,55 @@ async def download_video(url: str) -> DownloadResult:
     )
 
 
-def _recompress_sync(src: Path, dst: Path, target_bytes: int, duration: float) -> None:
+def _pick_height(video_kbps: int, original_height: int | None) -> int:
+    """Elige la altura objetivo según el bitrate de video calculado."""
+    if video_kbps < 400:
+        height = 360
+    elif video_kbps < 800:
+        height = 480
+    else:
+        height = 720
+    if original_height and original_height > 0:
+        height = min(height, original_height)
+    return height
+
+
+def _recompress_sync(
+    src: Path,
+    dst: Path,
+    target_bytes: int,
+    duration: float,
+    original_height: int | None = None,
+) -> None:
     """Recomprime a un bitrate objetivo (una sola pasada)."""
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RecompressError("ffmpeg no está disponible.")
 
     # Margen de seguridad del 10% y reserva para el audio.
-    audio_kbps = 96
+    audio_kbps = 64
     total_kbps = max(int((target_bytes * 8 * 0.9) / duration / 1000), audio_kbps + 50)
     video_kbps = total_kbps - audio_kbps
+    if video_kbps >= 400:
+        audio_kbps = 96
+        total_kbps = max(total_kbps, audio_kbps + 50)
+        video_kbps = total_kbps - audio_kbps
+
+    height = _pick_height(video_kbps, original_height)
+    logger.info(
+        "Recompresión: bitrate video=%d kbps, audio=%d kbps, altura=%dp",
+        video_kbps,
+        audio_kbps,
+        height,
+    )
 
     cmd = [
         ffmpeg,
         "-y",
         "-i",
         str(src),
+        "-vf",
+        f"scale=-2:{height}",
         "-c:v",
         "libx264",
         "-preset",
@@ -233,7 +266,11 @@ def _recompress_sync(src: Path, dst: Path, target_bytes: int, duration: float) -
         raise RecompressError(f"Falló la recompresión: {tail[0][:200]}")
 
 
-async def recompress_video(result: DownloadResult, target_bytes: int) -> DownloadResult:
+async def recompress_video(
+    result: DownloadResult,
+    target_bytes: int,
+    original_height: int | None = None,
+) -> DownloadResult:
     """Recomprime el video para intentar que quepa en target_bytes."""
     if not result.duration or result.duration <= 0:
         raise RecompressError("No se conoce la duración; no se puede recomprimir.")
@@ -241,7 +278,12 @@ async def recompress_video(result: DownloadResult, target_bytes: int) -> Downloa
     dst = result.path.with_name(f"{result.path.stem}_rc.mp4")
     try:
         await asyncio.to_thread(
-            _recompress_sync, result.path, dst, target_bytes, result.duration
+            _recompress_sync,
+            result.path,
+            dst,
+            target_bytes,
+            result.duration,
+            original_height,
         )
     except RecompressError:
         raise
