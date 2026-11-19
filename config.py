@@ -34,5 +34,11 @@ class Settings:
     r2_bucket: str = os.getenv("R2_BUCKET", "")
     link_expiry_hours: int = _int("LINK_EXPIRY_HOURS", 24)
 
+    # Seguridad / límites
+    allowed_guild_ids: tuple[int, ...] = tuple(
+        int(x) for x in os.getenv("ALLOWED_GUILD_IDS", "").replace(" ", "").split(",") if x.isdigit()
+    )
+    serper_daily_limit: int = _int("SERPER_DAILY_LIMIT", 50)
+
 
 settings = Settings()
