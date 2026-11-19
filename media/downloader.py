@@ -46,6 +46,10 @@ class VideoNetworkError(VideoError):
     """Fallo de red al contactar con el origen del video."""
 
 
+class VideoLoginRequiredError(VideoError):
+    """El origen exige iniciar sesión (p. ej. Instagram)."""
+
+
 class RecompressError(VideoError):
     """Falló la recompresión con ffmpeg."""
 
@@ -61,10 +65,20 @@ class DownloadResult:
     size: int
     height: int | None = None
     thumbnail: str | None = None
+    notice: str | None = None
+
+
+def _host_allowed(host: str) -> bool:
+    """Comprueba si el host (o un subdominio) está en ALLOWED_VIDEO_DOMAINS."""
+    host = host.lower().rstrip(".")
+    for domain in settings.allowed_video_domains:
+        if host == domain or host.endswith("." + domain):
+            return True
+    return False
 
 
 def _is_safe_url(url: str) -> bool:
-    """Solo permite http/https y rechaza hosts internos (localhost, IPs privadas)."""
+    """Solo permite http/https, dominios permitidos y rechaza hosts internos."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return False
@@ -72,6 +86,8 @@ def _is_safe_url(url: str) -> bool:
     if not host:
         return False
     if host.lower() in ("localhost", "127.0.0.1", "::1"):
+        return False
+    if not _host_allowed(host):
         return False
     try:
         infos = socket.getaddrinfo(host, None)
@@ -141,7 +157,23 @@ def _pick_host_formats(
         and f.get("vcodec") in (None, "none")
     ]
     if not videos:
-        return None
+        # Sin formatos con altura (p. ej. Instagram): usar el mejor disponible.
+        fallback = [
+            f
+            for f in formats
+            if f.get("vcodec") not in (None, "none") and f.get("format_id")
+        ]
+        if not fallback:
+            return None
+        best = max(
+            fallback,
+            key=lambda f: _estimate_size(f, duration) or 0,
+        )
+        logger.info(
+            "Sin formatos con altura; se usa el mejor disponible (%s)",
+            best.get("format_id"),
+        )
+        return best, None, 0, _estimate_size(best, duration) or 0
 
     # Audio más ligero con abr >= 96 (si no hay, el más ligero disponible).
     def _audio_size(f: dict) -> int:
@@ -189,6 +221,24 @@ def _pick_host_formats(
     return chosen, audio, chosen["height"], chosen_size
 
 
+_GENERIC_TITLES = {"", "instagram", "video", "reel", "post", "untitled"}
+
+
+def _pick_title(info: dict, fallback_stem: str) -> str:
+    """Elige un título útil; para Instagram usa @uploader si falta."""
+    title = (info.get("title") or "").strip()
+    if title and title.lower() not in _GENERIC_TITLES:
+        return title
+    uploader = (info.get("uploader") or info.get("uploader_id") or "").strip()
+    if uploader:
+        if not uploader.startswith("@"):
+            uploader = "@" + uploader
+        return f"Video de {uploader}"
+    if "instagram.com" in (info.get("webpage_url") or ""):
+        return "Video de Instagram"
+    return fallback_stem
+
+
 def _normalize_thumbnail(url: str | None) -> str | None:
     """Normaliza la miniatura: YouTube .webp -> .jpg."""
     if not url:
@@ -219,10 +269,10 @@ def _download_sync(
     max_bytes: int | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
-) -> tuple[Path, str, float | None, int, str | None]:
+) -> tuple[Path, str, float | None, int, str | None, str | None]:
     """Descarga bloqueante (se ejecuta en un hilo).
 
-    Devuelve (ruta, título, duración, altura_usada, thumbnail).
+    Devuelve (ruta, título, duración, altura_usada, thumbnail, aviso).
     """
     _notify(loop, on_status, "Obteniendo información del video...")
     ydl_opts = {
@@ -241,8 +291,23 @@ def _download_sync(
         info = ydl.extract_info(url, download=False)
     if not isinstance(info, dict):
         raise VideoUnavailableError("No se pudo leer la información del video.")
+
+    # Carrusel de Instagram: tomar solo la primera entrada.
+    notice: str | None = None
+    entries = info.get("entries")
+    if entries:
+        entries = [e for e in entries if isinstance(e, dict)]
+        if entries:
+            if len(entries) > 1:
+                notice = (
+                    f"El enlace contiene {len(entries)} elementos; "
+                    "se descarga solo el primero."
+                )
+                logger.info("Carrusel detectado (%d entradas); se usa la primera.", len(entries))
+            info = entries[0]
+
     duration = info.get("duration")
-    title = (info.get("title") or "").strip() or out_path.stem
+    title = _pick_title(info, out_path.stem)
     thumbnail = _normalize_thumbnail(info.get("thumbnail"))
     if duration and duration > settings.max_video_minutes * 60:
         raise VideoTooLongError(
@@ -261,7 +326,7 @@ def _download_sync(
                     "Descarga con formato pre-ajustado (<= %d bytes, altura<=480p)",
                     max_bytes,
                 )
-                return candidates[0], title, duration, 480, thumbnail
+                return candidates[0], title, duration, 480, thumbnail, notice
             for c in candidates:
                 c.unlink(missing_ok=True)
         except yt_dlp.utils.DownloadError:
@@ -317,7 +382,7 @@ def _download_sync(
     logger.info(
         "Tamaño real final: %d bytes (altura %dp)", final_path.stat().st_size, height
     )
-    return final_path, title, duration, height, thumbnail
+    return final_path, title, duration, height, thumbnail, notice
 
 
 class _YdlLogger:
@@ -340,6 +405,17 @@ class _YdlLogger:
 def _map_ytdlp_error(exc: yt_dlp.utils.DownloadError) -> VideoError:
     """Traduce un DownloadError de yt-dlp a un error con mensaje claro."""
     msg = str(exc).lower()
+    if (
+        "login" in msg
+        or "log in" in msg
+        or "sign in" in msg
+        or "cookies" in msg
+        or "rate-limit" in msg
+        or "rate limit" in msg
+    ):
+        return VideoLoginRequiredError(
+            "Instagram pide iniciar sesión para este contenido; no se puede descargar."
+        )
     if "private" in msg or "unavailable" in msg or "not available" in msg:
         return VideoUnavailableError("El video es privado o no está disponible.")
     if "age" in msg and "restrict" in msg:
@@ -367,6 +443,8 @@ async def download_video(
     if not _is_safe_url(url):
         raise VideoUnavailableError("La URL no es válida o apunta a un host no permitido.")
 
+    logger.info("Solicitud /video para dominio: %s", urlparse(url).hostname)
+
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
     out_path = settings.temp_dir / uuid.uuid4().hex
 
@@ -379,7 +457,7 @@ async def download_video(
         try:
             # yt-dlp y ffmpeg son bloqueantes: se ejecutan en un hilo para no
             # congelar el event loop (y la animación del estado).
-            path, title, duration, height, thumbnail = await asyncio.to_thread(
+            path, title, duration, height, thumbnail, notice = await asyncio.to_thread(
                 _download_sync, url, out_path, max_bytes, loop, on_status
             )
         except VideoError:
@@ -397,6 +475,7 @@ async def download_video(
         size=size,
         height=height,
         thumbnail=thumbnail,
+        notice=notice,
     )
 
 

@@ -51,6 +51,15 @@ class Settings:
     storage_max_retries: int = _int("STORAGE_MAX_RETRIES", 2)
     storage_circuit_seconds: int = _int("STORAGE_CIRCUIT_SECONDS", 300)
 
+    # Dominios permitidos para /video (se aceptan subdominios)
+    allowed_video_domains: tuple[str, ...] = tuple(
+        x.strip().lower()
+        for x in os.getenv(
+            "ALLOWED_VIDEO_DOMAINS", "youtube.com,youtu.be,instagram.com"
+        ).split(",")
+        if x.strip()
+    )
+
     # Seguridad / límites
     allowed_guild_ids: tuple[int, ...] = tuple(
         int(x) for x in os.getenv("ALLOWED_GUILD_IDS", "").replace(" ", "").split(",") if x.isdigit()

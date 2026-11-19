@@ -12,6 +12,7 @@ from media.downloader import (
     DownloadResult,
     RecompressError,
     VideoError,
+    VideoLoginRequiredError,
     VideoNetworkError,
     VideoRestrictedError,
     VideoTooLongError,
@@ -131,6 +132,9 @@ class Video(commands.Cog):
         except VideoNetworkError as exc:
             await status.stop()
             await self._fail(interaction, str(exc))
+        except VideoLoginRequiredError as exc:
+            await status.stop()
+            await self._fail(interaction, str(exc))
         except VideoUnavailableError as exc:
             await status.stop()
             await self._fail(interaction, str(exc))
@@ -177,6 +181,8 @@ class Video(commands.Cog):
         """Intenta enviar como adjunto. Devuelve True si se envió."""
         origen = "Adjunto (recomprimido)" if recompressed else "Adjunto"
         embed = discord.Embed(title=(result.title or "Video")[:256])
+        if result.notice:
+            embed.description = result.notice
         embed.set_footer(text=origen)
         await status.set("Enviando...")
         await status.stop()
@@ -246,10 +252,13 @@ class Video(commands.Cog):
 
         origen = f"Subido a {upload.provider}"
         size_mb = result.size / (1024 * 1024)
+        descripcion = "Toca el título para abrir el video"
+        if result.notice:
+            descripcion = f"{result.notice}\n{descripcion}"
         embed = discord.Embed(
             title=(result.title or "Video")[:256],
             url=upload.url,
-            description="Toca el título para abrir el video",
+            description=descripcion,
         )
         if result.thumbnail:
             embed.set_image(url=result.thumbnail)
