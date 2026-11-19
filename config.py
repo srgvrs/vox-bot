@@ -122,6 +122,17 @@ logger.info(
     settings.recompress_max_source_mb,
     settings.recompress_timeout_s,
 )
+logger.info(
+    "DISCORD_UPLOAD_LIMIT_MB en entorno=%r (efectivo=%d MB)",
+    os.getenv("DISCORD_UPLOAD_LIMIT_MB"),
+    settings.upload_limit_mb,
+)
+if settings.upload_limit_mb < 20:
+    logger.warning(
+        "upload_limit_mb=%d (< 20). Revisa que DISCORD_UPLOAD_LIMIT_MB=20 esté "
+        "en el .env del directorio de trabajo del bot y reinicia el proceso.",
+        settings.upload_limit_mb,
+    )
 if not settings.recompress_enabled:
     logger.warning(
         "RECOMPRESS_ENABLED=false: recompresión desactivada; los videos que no "
