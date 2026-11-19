@@ -65,6 +65,12 @@ class Video(commands.Cog):
         guild_limit = interaction.guild.filesize_limit if interaction.guild else 0
         config_limit = settings.upload_limit_mb * 1024 * 1024
         max_bytes = min(guild_limit, config_limit) if guild_limit else config_limit
+        logger.info(
+            "Límite de adjunto: %d bytes (env=%d MB, guild.filesize_limit=%d bytes)",
+            max_bytes,
+            settings.upload_limit_mb,
+            guild_limit,
+        )
 
         result: DownloadResult | None = None
         recompressed: DownloadResult | None = None
@@ -74,7 +80,12 @@ class Video(commands.Cog):
                 max_bytes=max_bytes,
                 on_status=status.set,
             )
-            logger.info("Descarga OK: %s (%d bytes)", result.title, result.size)
+            logger.info(
+                "Descarga OK: %s (%d bytes, límite adjunto %d bytes)",
+                result.title,
+                result.size,
+                max_bytes,
+            )
 
             # 1) Intentar adjunto directo.
             if result.size <= max_bytes:
@@ -84,8 +95,11 @@ class Video(commands.Cog):
                     return
 
             # 2) Recomprimir una sola vez (si la duración lo permite).
+            #    Si la duración es desconocida, se saltan las reglas por duración
+            #    pero no se bloquea la recompresión cuando el archivo no cabe.
+            duration_known = result.duration is not None and result.duration > 0
             duration_min = (result.duration or 0) / 60
-            if duration_min > settings.recompress_max_minutes:
+            if duration_known and duration_min > settings.recompress_max_minutes:
                 logger.info(
                     "Se omite la recompresión: duración %.1f min > RECOMPRESS_MAX_MINUTES=%d",
                     duration_min,
@@ -97,7 +111,7 @@ class Video(commands.Cog):
                         interaction, result, recompressed=False, status=status
                     ):
                         return
-            elif ffmpeg_available() and result.duration:
+            elif ffmpeg_available() and duration_known:
                 try:
                     recompressed = await recompress_video(
                         result,

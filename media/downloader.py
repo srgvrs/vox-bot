@@ -316,6 +316,48 @@ def _pick_instagram_short_side(
     return chosen, audio, _short_side(chosen) or 0, chosen_size
 
 
+def _probe_duration(path: Path) -> float | None:
+    """Mide la duración del archivo con ffprobe; None si no se puede."""
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        logger.warning("ffprobe no está disponible; no se puede medir la duración.")
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception as exc:
+        logger.warning("ffprobe falló al medir la duración: %s", exc)
+        return None
+    if proc.returncode != 0:
+        logger.warning(
+            "ffprobe devolvió código %d al medir la duración", proc.returncode
+        )
+        return None
+    raw = (proc.stdout or "").strip().splitlines()
+    if not raw:
+        return None
+    try:
+        value = float(raw[0])
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
 def _normalize_thumbnail(url: str | None) -> str | None:
     """Normaliza la miniatura: YouTube .webp -> .jpg."""
     if not url:
@@ -384,9 +426,11 @@ def _download_sync(
             info = entries[0]
 
     duration = info.get("duration")
+    if not isinstance(duration, (int, float)) or duration <= 0:
+        duration = None
     title = _pick_title(info, out_path.stem)
     thumbnail = _normalize_thumbnail(info.get("thumbnail"))
-    if duration and duration > settings.max_video_minutes * 60:
+    if duration is not None and duration > settings.max_video_minutes * 60:
         raise VideoTooLongError(
             f"El video dura más de {settings.max_video_minutes} minutos."
         )
@@ -399,9 +443,9 @@ def _download_sync(
         and duration > settings.instagram_long_reel_seconds
     )
     logger.info(
-        "Dominio=%s duración=%.1fs instagram=%s long_reel=%s",
+        "Dominio=%s duración=%s instagram=%s long_reel=%s",
         urlparse(url).hostname,
-        duration or 0.0,
+        f"{duration:.1f}s" if duration is not None else "desconocida",
         is_instagram,
         is_long_instagram,
     )
@@ -429,6 +473,11 @@ def _download_sync(
     #    MAX_VIDEO_HEIGHT. Los reels largos de Instagram se limitan a 480p
     #    (lado corto) para intentar que quepan como adjunto sin recomprimir.
     duration_min = (duration or 0) / 60
+    if duration is None:
+        logger.warning(
+            "Duración desconocida; se saltan las reglas por duración y se usa "
+            "el flujo de adjunto (recompresión permitida si no cabe)."
+        )
     if is_long_instagram:
         picked_ig = _pick_instagram_short_side(info, duration, max_bytes or 0)
         if picked_ig is not None:
@@ -451,7 +500,7 @@ def _download_sync(
                 "Instagram reel largo sin formatos con lado corto; se usa %dp", height
             )
             fmt = _build_short_side_format(height)
-    elif duration_min > settings.recompress_max_minutes:
+    elif duration is not None and duration_min > settings.recompress_max_minutes:
         host_max_bytes = settings.host_max_mb * 1024 * 1024
         picked = _pick_host_formats(info, duration, host_max_bytes)
         if picked is None:
@@ -494,12 +543,21 @@ def _download_sync(
     if not candidates:
         raise VideoUnavailableError("No se pudo descargar el video.")
     final_path = candidates[0]
+    if duration is None:
+        probed = _probe_duration(final_path)
+        if probed is not None:
+            duration = probed
+            logger.info("Duración medida con ffprobe: %.1fs", duration)
+        else:
+            logger.warning(
+                "No se pudo medir la duración del archivo; se deja como desconocida."
+            )
     logger.info(
-        "Tamaño real final: %d bytes (lado corto %dp, dominio=%s, duración=%.1fs)",
+        "Tamaño real final: %d bytes (lado corto %dp, dominio=%s, duración=%s)",
         final_path.stat().st_size,
         height,
         urlparse(url).hostname,
-        duration or 0.0,
+        f"{duration:.1f}s" if duration is not None else "desconocida",
     )
     return final_path, title, duration, height, thumbnail, notice
 
