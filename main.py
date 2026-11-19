@@ -149,7 +149,10 @@ def _prepare_path() -> None:
 
 
 def _cleanup_temp_dir() -> None:
-    """Borra archivos de TEMP_DIR con más de 1 hora de antigüedad."""
+    """Borra archivos de TEMP_DIR con más de 1 hora de antigüedad.
+
+    Omite `.gitkeep` para conservar la carpeta en el repositorio.
+    """
     temp_dir = settings.temp_dir
     if not temp_dir.exists():
         return
@@ -157,6 +160,8 @@ def _cleanup_temp_dir() -> None:
     removed = 0
     for entry in temp_dir.iterdir():
         if not entry.is_file():
+            continue
+        if entry.name == ".gitkeep":
             continue
         try:
             if entry.stat().st_mtime < cutoff:
@@ -254,6 +259,12 @@ async def _shutdown(bot: MediaBot) -> None:
 async def main() -> None:
     _setup_logging()
     _prepare_path()
+    try:
+        os.makedirs(settings.temp_dir, exist_ok=True)
+    except OSError as exc:
+        logging.warning(
+            "No se pudo crear TEMP_DIR (%s): %s", settings.temp_dir, exc
+        )
     _cleanup_temp_dir()
     if not settings.discord_token:
         raise SystemExit("Falta DISCORD_TOKEN en el archivo .env")
