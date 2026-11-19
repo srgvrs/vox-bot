@@ -22,9 +22,13 @@ logger = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 _MAX_OUTPUT_CHARS = 3900
-_MAX_QUESTION_CHARS = 1000
 _MEMORY_TURNS = 6
 _MEMORY_TTL_S = 15 * 60
+
+# Mensaje mostrado si la respuesta llega vacía o no se puede mostrar.
+_EMPTY_ANSWER_MESSAGE = (
+    "⚠️ La respuesta llegó vacía o no se pudo mostrar. Intenta de nuevo."
+)
 
 # Cooldown por usuario (monotonic).
 _last_ask: dict[int, float] = {}
@@ -136,28 +140,20 @@ def _truncate(text: str, limit: int = _MAX_OUTPUT_CHARS) -> str:
     return text[: limit - 1] + "…"
 
 
-def _build_embed(
-    user: discord.abc.User,
-    result,
-    question: str | None = None,
-) -> discord.Embed:
+def _build_embed(user: discord.abc.User, result) -> discord.Embed:
+    label = result.provider_label or result.provider
+    text = (result.text or "").strip()
+    if not text:
+        text = _EMPTY_ANSWER_MESSAGE
     embed = discord.Embed(
-        description=_truncate(result.text, _MAX_OUTPUT_CHARS),
+        description=_truncate(text, _MAX_OUTPUT_CHARS),
         color=discord.Color.blurple(),
     )
     embed.set_author(
-        name=user.display_name,
+        name=f"[{label}] respondió:",
         icon_url=user.display_avatar.url,
     )
-    if question is not None:
-        embed.add_field(
-            name="Pregunta",
-            value=_truncate(question, _MAX_QUESTION_CHARS),
-            inline=False,
-        )
-    embed.set_footer(
-        text=f"Respondido por {result.provider_label or result.provider} · {result.model}"
-    )
+    embed.set_footer(text=f"Modelo: {result.model}")
     return embed
 
 
@@ -365,7 +361,7 @@ class Chat(commands.Cog):
         memory.last_used = time.monotonic()
 
         await interaction.followup.send(
-            embed=_build_embed(interaction.user, result, question=texto),
+            embed=_build_embed(interaction.user, result),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 

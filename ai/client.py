@@ -250,9 +250,12 @@ async def _post_chat(
         raise _TransientError(f"red: {exc}") from exc
 
     try:
-        return data["choices"][0]["message"]["content"].strip()
+        content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise _TransientError("respuesta inválida") from exc
+    if not isinstance(content, str) or not content.strip():
+        raise _TransientError("respuesta vacía")
+    return content.strip()
 
 
 def _parse_retry_after(value: str | None) -> int | None:
