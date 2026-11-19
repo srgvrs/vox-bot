@@ -26,7 +26,11 @@ class StatusMessage:
         self._task: asyncio.Task | None = None
         self._stopped = False
         self._emoji = (settings.status_emoji or "").strip()
-        self._interval = 5.0 if self._emoji else 3.0
+        if settings.low_cpu_mode:
+            # LOW_CPU_MODE: animación muy lenta para reducir ediciones/CPU.
+            self._interval = 30.0
+        else:
+            self._interval = 5.0 if self._emoji else 3.0
         self._frame_idx = 0
 
     def _render(self) -> str:
