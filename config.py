@@ -33,13 +33,6 @@ class Settings:
     max_uploads_per_user_day: int = _int("MAX_UPLOADS_PER_USER_DAY", 10)
     temp_dir: Path = Path(os.getenv("TEMP_DIR", "temp"))
 
-    # Cloudflare R2 (API compatible con S3)
-    r2_account_id: str = os.getenv("R2_ACCOUNT_ID", "")
-    r2_access_key_id: str = os.getenv("R2_ACCESS_KEY_ID", "")
-    r2_secret_access_key: str = os.getenv("R2_SECRET_ACCESS_KEY", "")
-    r2_bucket: str = os.getenv("R2_BUCKET", "")
-    link_expiry_hours: int = _int("LINK_EXPIRY_HOURS", 24)
-
     # Hosts externos de subida (orden de preferencia)
     storage_providers: tuple[str, ...] = tuple(
         x.strip().lower()

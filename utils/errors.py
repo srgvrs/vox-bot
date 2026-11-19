@@ -36,8 +36,6 @@ def _sanitize(text: str) -> str:
     for secret in (
         settings.discord_token,
         settings.serper_api_key,
-        settings.r2_secret_access_key,
-        settings.r2_access_key_id,
     ):
         if secret:
             text = text.replace(secret, "***")
