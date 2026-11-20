@@ -6,6 +6,7 @@ import time
 import discord
 from discord.ext import commands
 
+from cogs.chat import Chat
 from cogs.video import MessageResponder, check_cooldown, run_video_flow
 from config import settings
 from media.downloader import _host_allowed
@@ -20,10 +21,17 @@ _UNEXPECTED_NOTICE_INTERVAL_S = 60
 _last_unexpected_notice: dict[int, float] = {}
 
 
+def _extract_urls(text: str) -> list[str]:
+    """Devuelve todas las URLs (http/https) del texto, sin puntuación final."""
+    urls: list[str] = []
+    for match in _URL_RE.finditer(text):
+        urls.append(match.group(0).rstrip(".,;:!?)]}\"'"))
+    return urls
+
+
 def _extract_video_url(text: str) -> str | None:
     """Devuelve la primera URL con dominio permitido, o None."""
-    for match in _URL_RE.finditer(text):
-        url = match.group(0).rstrip(".,;:!?)]}\"'")
+    for url in _extract_urls(text):
         try:
             from urllib.parse import urlparse
 
@@ -62,17 +70,72 @@ class Enlaces(commands.Cog):
         if not mentioned and not auto_channel:
             return
 
+        # --- Enrutado en modo mención -----------------------------------
+        if mentioned:
+            urls = _extract_urls(message.content)
+            if urls:
+                url = _extract_video_url(message.content)
+                if url is None:
+                    logger.info(
+                        "Mención con URL no soportada (usuario=%s canal=%s urls=%s)",
+                        message.author.id,
+                        message.channel.id,
+                        urls,
+                    )
+                    await message.reply(
+                        "Ese enlace no está soportado.",
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+                logger.info(
+                    "Mención -> ruta=descarga (usuario=%s canal=%s url=%s)",
+                    message.author.id,
+                    message.channel.id,
+                    url,
+                )
+            else:
+                # Sin URLs: si hay texto, va al chat; si está vacía, aviso.
+                text_only = message.content
+                if self.bot.user is not None:
+                    for mention in (
+                        f"<@{self.bot.user.id}>",
+                        f"<@!{self.bot.user.id}>",
+                    ):
+                        text_only = text_only.replace(mention, " ")
+                if not text_only.strip():
+                    logger.info(
+                        "Mención vacía (usuario=%s canal=%s)",
+                        message.author.id,
+                        message.channel.id,
+                    )
+                    await message.reply(
+                        "Mencióname con un enlace de YouTube o Instagram",
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+                logger.info(
+                    "Mención -> ruta=chat (usuario=%s canal=%s)",
+                    message.author.id,
+                    message.channel.id,
+                )
+                chat_cog = self.bot.get_cog("Chat")
+                if isinstance(chat_cog, Chat):
+                    await chat_cog.handle_mention(message)
+                else:
+                    logger.warning(
+                        "Cog Chat no disponible para mención (usuario=%s)",
+                        message.author.id,
+                    )
+                return
+
+        # --- Modo automático (canal) ------------------------------------
         url = _extract_video_url(message.content)
         if url is None:
-            if mentioned:
-                await message.reply(
-                    "Mencióname con un enlace de YouTube o Instagram",
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
             return
 
-        origin = "mencion" if mentioned else "auto"
+        origin = "auto"
         remaining = check_cooldown(message.author.id)
         if remaining > 0:
             await message.reply(
@@ -102,6 +165,13 @@ class Enlaces(commands.Cog):
             f"{env_limit_mb} MB" if env_limit_mb is not None else "no definido",
             max_bytes,
             origen_limite,
+        )
+
+        logger.info(
+            "Ruta=descarga (auto) usuario=%s canal=%s url=%s",
+            message.author.id,
+            message.channel.id,
+            url,
         )
 
         responder = MessageResponder(message)

@@ -30,6 +30,12 @@ _EMPTY_ANSWER_MESSAGE = (
     "⚠️ La respuesta llegó vacía o no se pudo mostrar. Intenta de nuevo."
 )
 
+# Mensaje corto cuando el chat falla o está desactivado.
+_CHAT_FAILED_MESSAGE = "No pude responder ahora, intenta de nuevo."
+
+# Tamaño máximo por mensaje al dividir respuestas largas.
+_CHUNK_SIZE = 1900
+
 # Cooldown por usuario (monotonic).
 _last_ask: dict[int, float] = {}
 # Contador diario global (UTC).
@@ -140,21 +146,28 @@ def _truncate(text: str, limit: int = _MAX_OUTPUT_CHARS) -> str:
     return text[: limit - 1] + "…"
 
 
-def _build_embed(user: discord.abc.User, result) -> discord.Embed:
-    label = result.provider_label or result.provider
-    text = (result.text or "").strip()
+def _split_message(text: str, limit: int = _CHUNK_SIZE) -> list[str]:
+    """Divide un texto en trozos <= limit, cortando por saltos de línea o espacios."""
+    text = text.strip()
     if not text:
-        text = _EMPTY_ANSWER_MESSAGE
-    embed = discord.Embed(
-        description=_truncate(text, _MAX_OUTPUT_CHARS),
-        color=discord.Color.blurple(),
-    )
-    embed.set_author(
-        name=f"[{label}] respondió:",
-        icon_url=user.display_avatar.url,
-    )
-    embed.set_footer(text=f"Modelo: {result.model}")
-    return embed
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = window.rfind("\n")
+        if cut < limit // 2:
+            cut = window.rfind(" ")
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 class Chat(commands.Cog):
@@ -185,6 +198,13 @@ class Chat(commands.Cog):
                 message.author.id if message.author else "?",
             )
 
+    async def handle_mention(self, message: discord.Message) -> None:
+        """Punto de entrada público para el flujo de mención (chat).
+
+        Lo invoca el cog de enlaces cuando la mención no contiene URLs.
+        """
+        await self._handle_mention(message)
+
     async def _handle_mention(self, message: discord.Message) -> None:
         if message.author.bot:
             return
@@ -193,8 +213,6 @@ class Chat(commands.Cog):
         if not _guild_allowed(message.guild):
             return
         if not _channel_allowed(message.channel.id):
-            return
-        if not store.enabled:
             return
         if self.bot.user is None or self.bot.user not in message.mentions:
             return
@@ -207,6 +225,20 @@ class Chat(commands.Cog):
         text = text.strip()
         if not text:
             return
+
+        if not store.enabled:
+            logger.info(
+                "Chat desactivado; mención ignorada (usuario=%s canal=%s)",
+                message.author.id,
+                message.channel.id,
+            )
+            await message.reply(
+                _CHAT_FAILED_MESSAGE,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
         if len(text) > settings.chat_max_input_chars:
             await message.reply(
                 f"Tu mensaje supera el máximo de "
@@ -246,10 +278,17 @@ class Chat(commands.Cog):
         memory = _get_memory(message.channel.id, message.author.id)
         messages = _build_messages(memory, text)
         try:
-            result = await self._ask(messages)
-        except AIError:
+            async with message.channel.typing():
+                result = await self._ask(messages)
+        except AIError as exc:
+            logger.warning(
+                "Chat no disponible (mención) usuario=%s canal=%s: %s",
+                message.author.id,
+                message.channel.id,
+                exc,
+            )
             await message.reply(
-                AI_UNAVAILABLE_MESSAGE,
+                _CHAT_FAILED_MESSAGE,
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -264,21 +303,34 @@ class Chat(commands.Cog):
             )
             await report_error(f"chat ref={ref}", exc)
             await message.reply(
-                UNEXPECTED_ERROR_MESSAGE.format(ref=ref),
+                _CHAT_FAILED_MESSAGE,
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
+        logger.info(
+            "Chat respondió (mención) usuario=%s canal=%s proveedor=%s modelo=%s",
+            message.author.id,
+            message.channel.id,
+            result.provider,
+            result.model,
+        )
+
         memory.turns.append(_Turn(role="user", content=text))
         memory.turns.append(_Turn(role="assistant", content=result.text))
         memory.last_used = time.monotonic()
 
-        await message.reply(
-            embed=_build_embed(message.author, result),
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        answer = (result.text or "").strip() or _EMPTY_ANSWER_MESSAGE
+        chunks = _split_message(answer)
+        if not chunks:
+            chunks = [_EMPTY_ANSWER_MESSAGE]
+        for chunk in chunks:
+            await message.reply(
+                chunk,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     # --- Comando /preguntar ----------------------------------------------
 
@@ -351,9 +403,15 @@ class Chat(commands.Cog):
         messages = _build_messages(memory, texto)
         try:
             result = await self._ask(messages)
-        except AIError:
+        except AIError as exc:
+            logger.warning(
+                "Chat no disponible (/preguntar) usuario=%s canal=%s: %s",
+                interaction.user.id,
+                interaction.channel_id,
+                exc,
+            )
             await interaction.followup.send(
-                AI_UNAVAILABLE_MESSAGE, ephemeral=True
+                _CHAT_FAILED_MESSAGE, ephemeral=True
             )
             return
         except Exception as exc:
@@ -366,18 +424,31 @@ class Chat(commands.Cog):
             )
             await report_error(f"chat ref={ref}", exc)
             await interaction.followup.send(
-                UNEXPECTED_ERROR_MESSAGE.format(ref=ref), ephemeral=True
+                _CHAT_FAILED_MESSAGE, ephemeral=True
             )
             return
+
+        logger.info(
+            "Chat respondió (/preguntar) usuario=%s canal=%s proveedor=%s modelo=%s",
+            interaction.user.id,
+            interaction.channel_id,
+            result.provider,
+            result.model,
+        )
 
         memory.turns.append(_Turn(role="user", content=texto))
         memory.turns.append(_Turn(role="assistant", content=result.text))
         memory.last_used = time.monotonic()
 
-        await interaction.followup.send(
-            embed=_build_embed(interaction.user, result),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        answer = (result.text or "").strip() or _EMPTY_ANSWER_MESSAGE
+        chunks = _split_message(answer)
+        if not chunks:
+            chunks = [_EMPTY_ANSWER_MESSAGE]
+        for chunk in chunks:
+            await interaction.followup.send(
+                chunk,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     async def _ask(self, messages: list[dict[str, str]]):
         if self.session is None:
