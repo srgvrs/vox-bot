@@ -108,7 +108,7 @@ class Settings:
     # Hosts externos de subida (orden de preferencia)
     storage_providers: tuple[str, ...] = tuple(
         x.strip().lower()
-        for x in os.getenv("STORAGE_PROVIDERS", "litterbox,storage_to,gofile").split(",")
+        for x in os.getenv("STORAGE_PROVIDERS", "litterbox,storage_to").split(",")
         if x.strip()
     )
     litterbox_expiry: str = os.getenv("LITTERBOX_EXPIRY", "24h")
