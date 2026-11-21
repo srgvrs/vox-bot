@@ -106,7 +106,9 @@ class InteractionResponder:
         recompressed: bool,
         upload: UploadResult | None,
     ) -> None:
+        await self.status.set("✅ Listo")
         await self.status.stop()
+        await asyncio.sleep(3)
         if upload is None:
             origen = "Adjunto (recomprimido)" if recompressed else "Adjunto"
             embed = discord.Embed(title=(result.title or "Video")[:256])
@@ -187,7 +189,10 @@ class InteractionResponder:
                 )
 
     async def send_error(self, mensaje: str) -> None:
+        short = mensaje.splitlines()[0][:200] if mensaje else "Error"
+        await self.status.set(f"❌ {short}")
         await self.status.stop()
+        await asyncio.sleep(3)
         try:
             await self.interaction.delete_original_response()
         except (discord.HTTPException, discord.NotFound) as exc:
@@ -265,7 +270,8 @@ class MessageResponder:
         recompressed: bool,
         upload: UploadResult | None,
     ) -> None:
-        reply = await self._ensure_reply("Listo")
+        reply = await self._ensure_reply("✅ Listo")
+        await asyncio.sleep(3)
         if upload is None:
             origen = "Adjunto (recomprimido)" if recompressed else "Adjunto"
             embed = discord.Embed(title=(result.title or "Video")[:256])
@@ -339,7 +345,9 @@ class MessageResponder:
         )
 
     async def send_error(self, mensaje: str) -> None:
-        reply = await self._ensure_reply(mensaje)
+        short = mensaje.splitlines()[0][:200] if mensaje else "Error"
+        reply = await self._ensure_reply(f"❌ {short}")
+        await asyncio.sleep(3)
         try:
             await reply.edit(
                 content=mensaje,
@@ -422,6 +430,18 @@ async def run_video_flow(
             url, user_id, responder, max_bytes, origin, channel_id
         )
 
+    async def _on_queued(job: Job, position: int) -> None:
+        try:
+            await responder.set_status(f"⏳ En cola: posición {position}")
+        except Exception:
+            logger.debug("No se pudo actualizar el estado de cola")
+
+    async def _on_started(job: Job) -> None:
+        try:
+            await responder.set_status("⏳ Iniciando...")
+        except Exception:
+            logger.debug("No se pudo actualizar el estado de inicio")
+
     async def _on_timeout(job: Job) -> None:
         logger.warning(
             "Timeout de video: usuario=%s canal=%s url=%s",
@@ -444,6 +464,8 @@ async def run_video_flow(
         timeout_s=float(settings.video_timeout_s),
         runner=_runner,
         on_timeout=_on_timeout,
+        on_queued=_on_queued,
+        on_started=_on_started,
     )
     try:
         await video_queue.submit(job)
@@ -471,6 +493,14 @@ async def _run_video_flow_inner(
     # Margen de seguridad: Discord rechaza adjuntos que rozan el límite.
     safe_bytes = int(max_bytes * _ATTACHMENT_SAFETY_MARGIN)
 
+    def _on_progress(event: str, text: str) -> None:
+        """Mapea eventos del downloader a líneas de estado (fire-and-forget)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(responder.set_status(text))
+
     result: DownloadResult | None = None
     recompressed: DownloadResult | None = None
     try:
@@ -478,6 +508,7 @@ async def _run_video_flow_inner(
             url,
             max_bytes=safe_bytes,
             on_status=responder.set_status,
+            on_progress=_on_progress,
         )
         logger.info(
             "Descarga OK: %s (%d bytes, límite adjunto seguro %d bytes)",
@@ -556,6 +587,7 @@ async def _run_video_flow_inner(
             )
         else:
             try:
+                await responder.set_status("Recomprimiendo video...")
                 recompressed = await recompress_video(
                     result,
                     safe_bytes,
@@ -614,6 +646,7 @@ async def _run_video_flow_inner(
             final.size / (1024 * 1024),
             final is recompressed,
         )
+        await responder.set_status("Subiendo a host externo...")
         await _upload_external(
             final, user_id, responder, recompressed=final is recompressed
         )

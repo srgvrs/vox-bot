@@ -53,6 +53,8 @@ class Job:
     timeout_s: float
     runner: Callable[["Job"], Awaitable[Any]]
     on_timeout: Callable[["Job"], Awaitable[None]] | None = None
+    on_queued: Callable[["Job", int], Awaitable[None]] | None = None
+    on_started: Callable[["Job"], Awaitable[None]] | None = None
     temp_dir: Path | None = None
     future: asyncio.Future = field(default_factory=asyncio.Future)
     enqueued_at: float = field(default_factory=time.monotonic)
@@ -149,6 +151,11 @@ class VideoQueue:
             job.priority,
             self._queue.qsize(),
         )
+        if job.on_queued is not None:
+            try:
+                await job.on_queued(job, self._queue.qsize())
+            except Exception:
+                logger.exception("on_queued falló")
         return await job.future
 
     # --- Worker -----------------------------------------------------------
@@ -175,6 +182,11 @@ class VideoQueue:
                 job.url,
                 job.timeout_s,
             )
+            if job.on_started is not None:
+                try:
+                    await job.on_started(job)
+                except Exception:
+                    logger.exception("on_started falló")
             try:
                 result = await asyncio.wait_for(
                     job.runner(job), timeout=job.timeout_s

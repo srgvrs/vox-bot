@@ -41,6 +41,10 @@ _RECOMPRESS_MIN_VIDEO_KBPS = 150
 _EXTRACT_TIMEOUT_S = 60
 
 
+# Tipo del callback de progreso: recibe un evento corto y el texto de estado.
+ProgressCallback = Callable[[str, str], None]
+
+
 class VideoError(Exception):
     """Error de descarga de video con mensaje apto para el usuario."""
 
@@ -628,12 +632,25 @@ def _notify(
         logger.debug("No se pudo programar el estado: %s", text)
 
 
+def _emit_progress(
+    on_progress: ProgressCallback | None, event: str, text: str
+) -> None:
+    """Invoca el callback de progreso (síncrono, tolerante a fallos)."""
+    if on_progress is None:
+        return
+    try:
+        on_progress(event, text)
+    except Exception:
+        logger.debug("on_progress falló (event=%s)", event)
+
+
 async def _download_with_format(
     url: str,
     out_path: Path,
     format_spec: str,
     max_filesize: int | None = None,
     extra_args: list[str] | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> Path | None:
     """Descarga con IDs exactos vía CLI. Devuelve la ruta o None si no cabe."""
     args = [
@@ -645,6 +662,8 @@ async def _download_with_format(
         "--no-warnings",
         "--concurrent-fragments",
         "8",
+        "--newline",
+        "--progress",
         "-o",
         str(out_path.with_suffix(".%(ext)s")),
     ]
@@ -674,6 +693,7 @@ async def _download_with_format(
     candidates = list(out_path.parent.glob(f"{out_path.stem}.*"))
     if not candidates:
         return None
+    _emit_progress(on_progress, "descargado", "Video descargado")
     return candidates[0]
 
 
@@ -683,6 +703,7 @@ async def _download_sync(
     max_bytes: int | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> tuple[Path, str, float | None, int, str | None, str | None, str | None, str | None, str]:
     """Descarga el video con escalones de formato (Fase 2).
 
@@ -690,6 +711,7 @@ async def _download_sync(
     video_id, mode). mode ∈ {"attachment", "recompress", "host"}.
     """
     _notify(loop, on_status, "Obteniendo información del video...")
+    _emit_progress(on_progress, "analizado", "Analizando video")
     work_dir = out_path.parent
     info = await _extract_info_cli(url, work_dir)
 
@@ -764,7 +786,11 @@ async def _download_sync(
             )
             fmt = _build_short_side_format(height)
         _notify(loop, on_status, f"Descargando video ({height}p)...")
-        final_path = await _download_with_format(url, out_path, fmt)
+        _emit_progress(on_progress, "formato", f"Formato elegido: {height}p")
+        _emit_progress(on_progress, "descargando", f"Descargando video ({height}p)")
+        final_path = await _download_with_format(
+            url, out_path, fmt, on_progress=on_progress
+        )
         if final_path is None:
             raise VideoUnavailableError("No se pudo descargar el video.")
         if duration is None:
@@ -817,8 +843,18 @@ async def _download_sync(
         idx = candidates.index(chosen)
         for cand in candidates[idx:]:
             _notify(loop, on_status, f"Descargando video ({cand.height}p)...")
+            _emit_progress(
+                on_progress, "formato", f"Formato elegido: {cand.height}p"
+            )
+            _emit_progress(
+                on_progress, "descargando", f"Descargando video ({cand.height}p)"
+            )
             final_path = await _download_with_format(
-                url, out_path, cand.format_spec, max_filesize=limit_bytes
+                url,
+                out_path,
+                cand.format_spec,
+                max_filesize=limit_bytes,
+                on_progress=on_progress,
             )
             if final_path is None:
                 logger.info(
@@ -897,8 +933,18 @@ async def _download_sync(
 
     if can_recompress and smallest is not None:
         _notify(loop, on_status, f"Descargando video ({smallest.height}p)...")
+        _emit_progress(
+            on_progress, "formato", f"Formato elegido: {smallest.height}p"
+        )
+        _emit_progress(
+            on_progress, "descargando", f"Descargando video ({smallest.height}p)"
+        )
         final_path = await _download_with_format(
-            url, out_path, smallest.format_spec, max_filesize=None
+            url,
+            out_path,
+            smallest.format_spec,
+            max_filesize=None,
+            on_progress=on_progress,
         )
         if final_path is None:
             raise VideoUnavailableError("No se pudo descargar el video.")
@@ -930,8 +976,14 @@ async def _download_sync(
         host_height,
     )
     _notify(loop, on_status, f"Descargando video ({host_height}p)...")
+    _emit_progress(on_progress, "formato", f"Formato elegido: {host_height}p")
+    _emit_progress(
+        on_progress, "descargando", f"Descargando video ({host_height}p)"
+    )
     fmt = _build_format(host_height)
-    final_path = await _download_with_format(url, out_path, fmt)
+    final_path = await _download_with_format(
+        url, out_path, fmt, on_progress=on_progress
+    )
     if final_path is None:
         raise VideoUnavailableError("No se pudo descargar el video.")
     if duration is None:
@@ -1023,6 +1075,7 @@ async def download_video(
     url: str,
     max_bytes: int | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> DownloadResult:
     """Descarga un video (máx. 720p) y devuelve el resultado con metadatos."""
     if not _is_safe_url(url):
@@ -1050,7 +1103,9 @@ async def download_video(
             extractor,
             video_id,
             mode,
-        ) = await _download_sync(url, out_path, max_bytes, loop, on_status)
+        ) = await _download_sync(
+            url, out_path, max_bytes, loop, on_status, on_progress
+        )
     except VideoError:
         raise
     except yt_dlp.utils.DownloadError as exc:
