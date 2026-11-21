@@ -97,6 +97,7 @@ class Settings:
     video_timeout_largo_s: int = _int("VIDEO_TIMEOUT_LARGO_S", 900)
     max_uploads_per_user_day: int = _int("MAX_UPLOADS_PER_USER_DAY", 10)
     temp_dir: Path = Path(os.getenv("TEMP_DIR", "temp"))
+    temp_max_age_min: int = _int("TEMP_MAX_AGE_MIN", 60)
     # Caché de videos ya descargados (Fase 3).
     cache_dir: Path = Path(os.getenv("CACHE_DIR", "cache"))
     video_cache_min: int = _int("VIDEO_CACHE_MIN", 30)
