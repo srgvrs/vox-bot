@@ -387,6 +387,9 @@ async def _shutdown(bot: MediaBot) -> None:
     except Exception as exc:
         logging.warning("Error al cerrar la caché de video: %s", exc)
     _cleanup_temp_dir()
+    from utils.limpieza_temp import limpiar_temp
+
+    limpiar_temp()
     try:
         await bot.close()
     except Exception as exc:

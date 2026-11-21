@@ -1173,6 +1173,9 @@ async def _download_largo(url, exc, on_status, on_progress) -> DownloadResult:
         )
     from services.video_queue import extend_timeout
     extend_timeout(settings.video_timeout_largo_s)
+    from utils.limpieza_temp import limpiar_temp
+
+    await asyncio.to_thread(limpiar_temp)
     carpeta = settings.temp_dir / uuid.uuid4().hex
     try:
         path = await descargar_largo(url, info, carpeta, on_progress)
