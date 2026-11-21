@@ -48,3 +48,22 @@ def limpiar_temp(max_age_min: int | None = None) -> int:
     if borradas:
         logger.info("Limpieza de TEMP_DIR: %d carpetas eliminadas", borradas)
     return borradas
+
+
+def borrar_carpeta_trabajo(archivo: Path) -> bool:
+    """Borra la carpeta padre de `archivo` si es una carpeta de trabajo de TEMP_DIR.
+
+    Solo actúa si la carpeta es hija directa de TEMP_DIR y su nombre es
+    hexadecimal de 32 caracteres. Devuelve True si la borró.
+    """
+    try:
+        carpeta = archivo.parent.resolve()
+        raiz = settings.temp_dir.resolve()
+        if carpeta.parent != raiz or not _NOMBRE_CARPETA.match(carpeta.name):
+            return False
+        shutil.rmtree(carpeta)
+    except OSError as exc:
+        logger.warning("No se pudo borrar la carpeta de trabajo de %s: %s", archivo, exc)
+        return False
+    logger.info("Carpeta de trabajo eliminada: %s", carpeta.name)
+    return True
