@@ -63,6 +63,38 @@ _ATTACHMENT_SAFETY_MARGIN = 0.97
 # 0 = sin restricción (adjunto); >0 = altura máxima (host).
 _CACHE_LEVEL_ATTACHMENT = 0
 
+# Retrasos de borrado del mensaje de estado según el motivo de cierre.
+_CLOSE_DELAYS: dict[str, float] = {
+    "ok": 3.0,
+    "cache": 3.0,
+    "error": 15.0,
+    "timeout": 15.0,
+    "rechazado": 10.0,
+    "cancelado": 0.0,
+}
+
+# Tareas de borrado diferido pendientes (para cancelarlas en el cierre limpio).
+_pending_deletions: set[asyncio.Task] = set()
+
+
+def _track_deletion(task: asyncio.Task) -> None:
+    """Registra una tarea de borrado diferido y la quita al terminar."""
+    _pending_deletions.add(task)
+    task.add_done_callback(_pending_deletions.discard)
+
+
+async def cancel_pending_deletions() -> None:
+    """Cancela las tareas de borrado pendientes (cierre limpio del bot)."""
+    tasks = list(_pending_deletions)
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    _pending_deletions.clear()
+
 
 def _is_attachment_too_large(exc: discord.HTTPException) -> bool:
     """Detecta el rechazo de Discord por adjunto demasiado grande (413 / 40005)."""
@@ -94,6 +126,9 @@ class Responder(Protocol):
     async def set_status(self, texto: str) -> None:
         """Actualiza el mensaje de estado."""
 
+    async def close(self, reason: str) -> None:
+        """Cierra el ciclo de vida del mensaje de estado (idempotente)."""
+
     async def send_result(
         self,
         result: DownloadResult,
@@ -112,9 +147,41 @@ class InteractionResponder:
     def __init__(self, interaction: discord.Interaction) -> None:
         self.interaction = interaction
         self.status = StatusMessage(interaction)
+        self._closed = False
 
     async def set_status(self, texto: str) -> None:
+        if self._closed:
+            return
         await self.status.set(texto)
+
+    async def close(self, reason: str) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self.status.stop()
+        delay = _CLOSE_DELAYS.get(reason, 3.0)
+        task = asyncio.create_task(self._delete_after(delay, reason))
+        _track_deletion(task)
+
+    async def _delete_after(self, delay: float, reason: str) -> None:
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            await self.interaction.delete_original_response()
+            logger.info(
+                "Estado eliminado (usuario=%s, motivo=%s)",
+                self.interaction.user.id,
+                reason,
+            )
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as exc:
+            logger.warning(
+                "No se pudo borrar el estado (usuario=%s, motivo=%s): %s",
+                self.interaction.user.id,
+                reason,
+                exc,
+            )
 
     async def send_result(
         self,
@@ -124,8 +191,6 @@ class InteractionResponder:
         from_cache: bool = False,
     ) -> None:
         await self.status.set("✅ Listo")
-        await self.status.stop()
-        await asyncio.sleep(3)
         if upload is None:
             origen = "Adjunto (recomprimido)" if recompressed else "Adjunto"
             if from_cache:
@@ -212,12 +277,6 @@ class InteractionResponder:
     async def send_error(self, mensaje: str) -> None:
         short = mensaje.splitlines()[0][:200] if mensaje else "Error"
         await self.status.set(f"❌ {short}")
-        await self.status.stop()
-        await asyncio.sleep(3)
-        try:
-            await self.interaction.delete_original_response()
-        except (discord.HTTPException, discord.NotFound) as exc:
-            logger.debug("No se pudo borrar el mensaje de estado: %s", exc)
         try:
             await self.interaction.followup.send(mensaje, ephemeral=True)
         except discord.HTTPException:
@@ -235,6 +294,7 @@ class MessageResponder:
         self.reply: discord.Message | None = None
         self.delete_original = settings.delete_original_message
         self.author_label = f"Pedido por {message.author.display_name}"
+        self._closed = False
 
     async def _ensure_reply(self, content: str) -> discord.Message:
         if self.reply is None:
@@ -276,6 +336,8 @@ class MessageResponder:
             )
 
     async def set_status(self, texto: str) -> None:
+        if self._closed:
+            return
         reply = await self._ensure_reply(texto)
         try:
             await reply.edit(
@@ -285,6 +347,35 @@ class MessageResponder:
         except discord.HTTPException as exc:
             logger.debug("No se pudo editar el estado del mensaje: %s", exc)
 
+    async def close(self, reason: str) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        delay = _CLOSE_DELAYS.get(reason, 3.0)
+        task = asyncio.create_task(self._delete_after(delay, reason))
+        _track_deletion(task)
+
+    async def _delete_after(self, delay: float, reason: str) -> None:
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if self.reply is not None:
+                await self.reply.delete()
+            logger.info(
+                "Estado eliminado (usuario=%s, motivo=%s)",
+                self.message.author.id,
+                reason,
+            )
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as exc:
+            logger.warning(
+                "No se pudo borrar el estado (usuario=%s, motivo=%s): %s",
+                self.message.author.id,
+                reason,
+                exc,
+            )
+
     async def send_result(
         self,
         result: DownloadResult,
@@ -293,7 +384,6 @@ class MessageResponder:
         from_cache: bool = False,
     ) -> None:
         reply = await self._ensure_reply("✅ Listo")
-        await asyncio.sleep(3)
         if upload is None:
             origen = "Adjunto (recomprimido)" if recompressed else "Adjunto"
             if from_cache:
@@ -349,12 +439,6 @@ class MessageResponder:
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             logger.info("Resultado de enlaces publicado como mensaje nuevo")
-            try:
-                await reply.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-                logger.debug(
-                    "No se pudo borrar el mensaje de progreso: %s", exc
-                )
             return
         except (discord.Forbidden, discord.HTTPException) as exc:
             logger.warning(
@@ -373,7 +457,6 @@ class MessageResponder:
     async def send_error(self, mensaje: str) -> None:
         short = mensaje.splitlines()[0][:200] if mensaje else "Error"
         reply = await self._ensure_reply(f"❌ {short}")
-        await asyncio.sleep(3)
         try:
             await reply.edit(
                 content=mensaje,
@@ -645,17 +728,21 @@ async def run_video_flow(
         on_timeout=_on_timeout,
         on_queued=_on_queued,
         on_started=_on_started,
+        responder=responder,
     )
     try:
         await video_queue.submit(job)
     except UserBusy:
         await responder.send_error("Ya tienes un video en proceso.")
+        await responder.close("rechazado")
     except QueueFull:
         await responder.send_error("Ocupado, intenta en un momento")
+        await responder.close("rechazado")
     except QueueClosed:
         await responder.send_error("El bot se está reiniciando")
+        await responder.close("rechazado")
     except JobTimeout:
-        # on_timeout ya avisó al usuario.
+        # on_timeout ya avisó al usuario; el worker cierra el estado.
         pass
 
 
@@ -1003,6 +1090,7 @@ class Video(commands.Cog):
             )
             await report_error(f"video ref={ref}", exc)
             await _reply_unexpected(interaction, ref)
+            await responder.close("error")
 
 
 async def _reply_unexpected(

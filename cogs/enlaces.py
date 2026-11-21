@@ -241,6 +241,7 @@ class Enlaces(commands.Cog):
             )
             await report_error(f"enlaces ref={ref}", exc)
             await _notify_unexpected(message, responder, ref)
+            await responder.close("error")
 
 
 async def _notify_unexpected(

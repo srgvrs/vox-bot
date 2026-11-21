@@ -55,6 +55,7 @@ class Job:
     on_timeout: Callable[["Job"], Awaitable[None]] | None = None
     on_queued: Callable[["Job", int], Awaitable[None]] | None = None
     on_started: Callable[["Job"], Awaitable[None]] | None = None
+    responder: Any = None
     temp_dir: Path | None = None
     future: asyncio.Future = field(default_factory=asyncio.Future)
     enqueued_at: float = field(default_factory=time.monotonic)
@@ -187,6 +188,7 @@ class VideoQueue:
                     await job.on_started(job)
                 except Exception:
                     logger.exception("on_started falló")
+            close_reason = "ok"
             try:
                 result = await asyncio.wait_for(
                     job.runner(job), timeout=job.timeout_s
@@ -194,6 +196,7 @@ class VideoQueue:
                 if not job.future.done():
                     job.future.set_result(result)
             except asyncio.TimeoutError:
+                close_reason = "timeout"
                 logger.warning(
                     "VideoQueue[%d]: TIMEOUT usuario=%s url=%s (%.0fs)",
                     idx,
@@ -216,6 +219,7 @@ class VideoQueue:
                         )
                     )
             except asyncio.CancelledError:
+                close_reason = "cancelado"
                 if job.pid:
                     await kill_tree(job.pid)
                 self._cleanup_temp(job)
@@ -225,9 +229,15 @@ class VideoQueue:
                     )
                 raise
             except Exception as exc:
+                close_reason = "error"
                 if not job.future.done():
                     job.future.set_exception(exc)
             finally:
+                if job.responder is not None:
+                    try:
+                        await job.responder.close(close_reason)
+                    except Exception:
+                        logger.exception("close del responder falló")
                 self._active.pop(job.user_id, None)
                 logger.info(
                     "VideoQueue[%d]: fin usuario=%s (%.1fs)",
