@@ -7,6 +7,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import re
 import shutil
 import socket
 import time
@@ -14,7 +15,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 
@@ -39,6 +40,12 @@ _RECOMPRESS_AUDIO_KBPS = 64
 _RECOMPRESS_MIN_VIDEO_KBPS = 150
 # Timeout de la extracción con yt-dlp -J (segundos).
 _EXTRACT_TIMEOUT_S = 60
+
+# Regex para extraer el ID de YouTube sin red.
+_YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_YT_PATH_RE = re.compile(r"^/(?:shorts|embed|live|v)/([A-Za-z0-9_-]{11})")
+_YT_SHORT_RE = re.compile(r"^youtu\.be$")
+_YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
 
 
 # Tipo del callback de progreso: recibe un evento corto y el texto de estado.
@@ -130,6 +137,35 @@ def _is_safe_url(url: str) -> bool:
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
             return False
     return True
+
+
+def extract_youtube_id(url: str) -> str | None:
+    """Extrae el ID de un video de YouTube sin hacer red.
+
+    Soporta watch?v=, youtu.be/<id>, /shorts/<id>, /embed/<id>, /live/<id>.
+    Devuelve None si no es YouTube o el ID no es válido.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+    if _YT_SHORT_RE.match(host):
+        candidate = parsed.path.lstrip("/").split("/")[0]
+        return candidate if _YT_ID_RE.match(candidate) else None
+    if host not in _YT_HOSTS:
+        return None
+    if parsed.path == "/watch":
+        values = parse_qs(parsed.query).get("v") or []
+        if values and _YT_ID_RE.match(values[0]):
+            return values[0]
+        return None
+    match = _YT_PATH_RE.match(parsed.path)
+    if match:
+        return match.group(1)
+    return None
 
 
 def _short_side(fmt: dict) -> int | None:
@@ -567,6 +603,11 @@ async def _extract_info_cli(url: str, work_dir: Path) -> dict:
     return info
 
 
+async def extract_info(url: str, work_dir: Path) -> dict:
+    """Extrae la info del video con `yt-dlp -J` (paso público para la caché)."""
+    return await _extract_info_cli(url, work_dir)
+
+
 async def _probe_duration(path: Path) -> float | None:
     """Mide la duración del archivo con ffprobe; None si no se puede."""
     if shutil.which("ffprobe") is None:
@@ -704,16 +745,20 @@ async def _download_sync(
     loop: asyncio.AbstractEventLoop | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
     on_progress: ProgressCallback | None = None,
+    info: dict | None = None,
 ) -> tuple[Path, str, float | None, int, str | None, str | None, str | None, str | None, str]:
     """Descarga el video con escalones de formato (Fase 2).
 
     Devuelve (ruta, título, duración, altura, thumbnail, aviso, extractor,
     video_id, mode). mode ∈ {"attachment", "recompress", "host"}.
+
+    Si `info` se pasa, se reutiliza (evita repetir `yt-dlp -J`).
     """
     _notify(loop, on_status, "Obteniendo información del video...")
     _emit_progress(on_progress, "analizado", "Analizando video")
     work_dir = out_path.parent
-    info = await _extract_info_cli(url, work_dir)
+    if info is None:
+        info = await _extract_info_cli(url, work_dir)
 
     # Carrusel de Instagram: tomar solo la primera entrada.
     notice: str | None = None
@@ -1076,8 +1121,12 @@ async def download_video(
     max_bytes: int | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
     on_progress: ProgressCallback | None = None,
+    info: dict | None = None,
 ) -> DownloadResult:
-    """Descarga un video (máx. 720p) y devuelve el resultado con metadatos."""
+    """Descarga un video (máx. 720p) y devuelve el resultado con metadatos.
+
+    Si `info` se pasa, se reutiliza (evita repetir `yt-dlp -J`).
+    """
     if not _is_safe_url(url):
         raise VideoUnavailableError("La URL no es válida o apunta a un host no permitido.")
 
@@ -1104,7 +1153,7 @@ async def download_video(
             video_id,
             mode,
         ) = await _download_sync(
-            url, out_path, max_bytes, loop, on_status, on_progress
+            url, out_path, max_bytes, loop, on_status, on_progress, info=info
         )
     except VideoError:
         raise

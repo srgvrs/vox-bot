@@ -111,11 +111,20 @@ class Admin(commands.Cog):
         latency_ms = int(self.bot.latency * 1000) if self.bot.latency else -1
 
         try:
-            from media.downloader import _semaphore
+            from services.video_queue import video_queue
 
-            active = settings.max_concurrent_downloads - _semaphore._value
+            active = video_queue.active_count()
+            queued = video_queue.queue_size()
         except Exception:
             active = -1
+            queued = -1
+
+        try:
+            from services.video_cache import video_cache
+
+            cache_stats = video_cache.stats()
+        except Exception:
+            cache_stats = {"entries": -1, "bytes": -1, "hits": -1, "misses": -1}
 
         errors_last_hour = count_last_hour()
 
@@ -151,7 +160,22 @@ class Admin(commands.Cog):
             inline=True,
         )
         embed.add_field(
+            name="En cola",
+            value=str(queued) if queued >= 0 else "desconocido",
+            inline=True,
+        )
+        embed.add_field(
             name="Errores (última hora)", value=str(errors_last_hour), inline=True
+        )
+        embed.add_field(
+            name="Caché",
+            value=(
+                f"{_human_bytes(cache_stats['bytes'])} · "
+                f"{cache_stats['entries']} entradas\n"
+                f"Aciertos: {cache_stats['hits']} · "
+                f"Fallos: {cache_stats['misses']}"
+            ),
+            inline=False,
         )
         embed.add_field(
             name="TEMP_DIR",

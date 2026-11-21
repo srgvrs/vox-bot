@@ -93,6 +93,10 @@ class Settings:
     video_timeout_largo_s: int = _int("VIDEO_TIMEOUT_LARGO_S", 900)
     max_uploads_per_user_day: int = _int("MAX_UPLOADS_PER_USER_DAY", 10)
     temp_dir: Path = Path(os.getenv("TEMP_DIR", "temp"))
+    # Caché de videos ya descargados (Fase 3).
+    cache_dir: Path = Path(os.getenv("CACHE_DIR", "cache"))
+    video_cache_min: int = _int("VIDEO_CACHE_MIN", 30)
+    video_cache_mb: int = _int("VIDEO_CACHE_MB", 500)
 
     # Encoder de recompresión: auto | libx264 | h264_qsv
     encoder: str = os.getenv("ENCODER", "auto").strip().lower() or "auto"

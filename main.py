@@ -17,6 +17,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import settings
+from services.video_cache import video_cache
 from services.video_queue import video_queue
 from utils.errors import UNEXPECTED_ERROR_MESSAGE, new_error_ref, report_error
 
@@ -43,6 +44,7 @@ class MediaBot(commands.Bot):
         for cog in COGS:
             await self.load_extension(cog)
         await video_queue.start()
+        video_cache.start()
         _log_admin_ids()
         await _log_versions()
         self.tree.on_error = self._on_tree_error
@@ -380,6 +382,10 @@ async def _shutdown(bot: MediaBot) -> None:
         await video_queue.stop()
     except Exception as exc:
         logging.warning("Error al cerrar la cola de video: %s", exc)
+    try:
+        await video_cache.stop()
+    except Exception as exc:
+        logging.warning("Error al cerrar la caché de video: %s", exc)
     _cleanup_temp_dir()
     try:
         await bot.close()
@@ -396,7 +402,14 @@ async def main() -> None:
         logging.warning(
             "No se pudo crear TEMP_DIR (%s): %s", settings.temp_dir, exc
         )
+    try:
+        os.makedirs(settings.cache_dir, exist_ok=True)
+    except OSError as exc:
+        logging.warning(
+            "No se pudo crear CACHE_DIR (%s): %s", settings.cache_dir, exc
+        )
     _cleanup_temp_dir()
+    video_cache.wipe()
     if not settings.discord_token:
         raise SystemExit("Falta DISCORD_TOKEN en el archivo .env")
 

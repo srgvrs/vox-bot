@@ -5,6 +5,8 @@ __pycache__/
 *.pyc
 temp/*
 !temp/.gitkeep
+cache/*
+!cache/.gitkeep
 logs/
 data/
 .aider*

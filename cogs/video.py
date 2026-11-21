@@ -1,6 +1,7 @@
 """Cog de descarga de video: /video (adjunto o link)."""
 import asyncio
 import logging
+import shutil
 import time
 from collections import defaultdict
 from typing import Protocol
@@ -22,10 +23,20 @@ from media.downloader import (
     VideoUnavailableError,
     VideoUnsupportedError,
     download_video,
+    extract_info,
+    extract_youtube_id,
     ffmpeg_available,
     recompress_video,
 )
 from media.storage import StorageChain, StorageError, UploadResult
+from services.video_cache import (
+    MODE_ATTACHMENT,
+    MODE_HOST,
+    CacheEntry,
+    host_ttl_seconds,
+    new_cache_path,
+    video_cache,
+)
 from services.video_queue import (
     Job,
     JobTimeout,
@@ -46,6 +57,10 @@ _cooldowns: dict[int, float] = defaultdict(float)
 
 # Margen de seguridad al decidir si un archivo cabe como adjunto.
 _ATTACHMENT_SAFETY_MARGIN = 0.97
+
+# Nivel de calidad usado como parte de la clave de caché.
+# 0 = sin restricción (adjunto); >0 = altura máxima (host).
+_CACHE_LEVEL_ATTACHMENT = 0
 
 
 def _is_attachment_too_large(exc: discord.HTTPException) -> bool:
@@ -105,12 +120,15 @@ class InteractionResponder:
         result: DownloadResult,
         recompressed: bool,
         upload: UploadResult | None,
+        from_cache: bool = False,
     ) -> None:
         await self.status.set("✅ Listo")
         await self.status.stop()
         await asyncio.sleep(3)
         if upload is None:
             origen = "Adjunto (recomprimido)" if recompressed else "Adjunto"
+            if from_cache:
+                origen = f"{origen} (caché)"
             embed = discord.Embed(title=(result.title or "Video")[:256])
             if result.notice:
                 embed.description = result.notice
@@ -121,6 +139,8 @@ class InteractionResponder:
             )
             return
         origen = f"Subido a {upload.provider}"
+        if from_cache:
+            origen = f"{origen} (caché)"
         size_mb = result.size / (1024 * 1024)
         descripcion = "Toca el título para abrir el video"
         if result.notice:
@@ -269,11 +289,14 @@ class MessageResponder:
         result: DownloadResult,
         recompressed: bool,
         upload: UploadResult | None,
+        from_cache: bool = False,
     ) -> None:
         reply = await self._ensure_reply("✅ Listo")
         await asyncio.sleep(3)
         if upload is None:
             origen = "Adjunto (recomprimido)" if recompressed else "Adjunto"
+            if from_cache:
+                origen = f"{origen} (caché)"
             embed = discord.Embed(title=(result.title or "Video")[:256])
             if result.notice:
                 embed.description = result.notice
@@ -289,6 +312,8 @@ class MessageResponder:
             await self._delete_original()
             return
         origen = f"Subido a {upload.provider}"
+        if from_cache:
+            origen = f"{origen} (caché)"
         size_mb = result.size / (1024 * 1024)
         descripcion = "Toca el título para abrir el video"
         if result.notice:
@@ -357,14 +382,144 @@ class MessageResponder:
             logger.exception("No se pudo editar el mensaje de error")
 
 
+
+
+def _cache_key(
+    extractor: str | None,
+    video_id: str | None,
+    mode: str,
+    level: int,
+) -> tuple[str, str, str, int] | None:
+    """Construye la clave de caché; None si faltan extractor o id."""
+    if not extractor or not video_id:
+        return None
+    return (extractor.lower(), str(video_id), mode, level)
+
+
+def _entry_to_result(entry: CacheEntry) -> DownloadResult:
+    """Convierte una entrada de caché en DownloadResult para reutilizar el flujo."""
+    return DownloadResult(
+        path=entry.path or Path(),
+        title=entry.title,
+        recompressed=False,
+        duration=None,
+        size=entry.size,
+        height=entry.height,
+        thumbnail=entry.thumbnail,
+        notice=entry.notice,
+        extractor=entry.extractor,
+        video_id=entry.video_id,
+        mode=entry.key[2],
+    )
+
+
+def _entry_to_upload(entry: CacheEntry) -> UploadResult | None:
+    """Convierte una entrada de host en UploadResult (o None si es adjunto)."""
+    if entry.url is None:
+        return None
+    # expiry_hours se recalcula a partir de expires_at para el footer.
+    remaining_s = max(0, int((entry.expires_at or 0) - time.time()))
+    return UploadResult(
+        url=entry.url,
+        provider="caché",
+        expiry_hours=max(1, remaining_s // 3600),
+    )
+
+
+async def _try_cache_hit(
+    key: tuple[str, str, str, int],
+    max_bytes: int,
+    responder: Responder,
+    user_id: int,
+) -> bool:
+    """Intenta servir desde caché. Devuelve True si se envió."""
+    entry = video_cache.get(key, max_bytes)
+    if entry is None:
+        return False
+    if entry.path is not None and not entry.path.exists():
+        logger.info("VideoCache: archivo ausente en disco, se descarta: %s", key)
+        return False
+    video_cache.acquire(entry)
+    try:
+        await responder.set_status("♻️ Ya lo tenía, enviando...")
+        result = _entry_to_result(entry)
+        upload = _entry_to_upload(entry)
+        await responder.send_result(
+            result,
+            recompressed=False,
+            upload=upload,
+            from_cache=True,
+        )
+        logger.info("VideoCache: servido desde caché: %s", key)
+        return True
+    finally:
+        video_cache.release(entry)
+
+
+async def _store_in_cache(
+    result: DownloadResult,
+    key: tuple[str, str, str, int],
+    max_bytes: int,
+    upload: UploadResult | None,
+) -> None:
+    """Mueve el archivo a CACHE_DIR y registra la entrada."""
+    try:
+        if upload is None:
+            # Adjunto: mover el archivo a cache/.
+            dst = new_cache_path(result.path.suffix or ".mp4")
+            shutil.move(str(result.path), str(dst))
+            entry = CacheEntry(
+                key=key,
+                path=dst,
+                url=None,
+                created_at=time.time(),
+                size=dst.stat().st_size,
+                attachment_limit=max_bytes,
+                expires_at=time.time() + settings.video_cache_min * 60,
+                title=result.title,
+                height=result.height,
+                thumbnail=result.thumbnail,
+                extractor=result.extractor,
+                video_id=result.video_id,
+                notice=result.notice,
+            )
+            # Actualizar la ruta del resultado para que el finally no borre el archivo.
+            result.path = dst
+        else:
+            # Host: solo guardar el link.
+            ttl = host_ttl_seconds(upload.expiry_hours)
+            entry = CacheEntry(
+                key=key,
+                path=None,
+                url=upload.url,
+                created_at=time.time(),
+                size=result.size,
+                attachment_limit=max_bytes,
+                expires_at=time.time() + ttl,
+                title=result.title,
+                height=result.height,
+                thumbnail=result.thumbnail,
+                extractor=result.extractor,
+                video_id=result.video_id,
+                notice=result.notice,
+            )
+        video_cache.put(entry)
+        logger.info("VideoCache: guardado %s", key)
+    except Exception:
+        logger.exception("VideoCache: no se pudo guardar %s", key)
+
+
 async def _upload_external(
     final: DownloadResult,
     user_id: int,
     responder: Responder,
     recompressed: bool,
+    cache_key: tuple[str, str, str, int] | None = None,
+    max_bytes: int = 0,
+    count_quota: bool = True,
 ) -> None:
     """Sube el archivo a un host externo y envía el link."""
-    if not _upload_limiter.is_allowed(user_id):
+    if count_quota and not _upload_limiter.is_allowed(user_id):
         logger.info(
             "Subida externa rechazada: usuario=%s alcanzó MAX_UPLOADS_PER_USER_DAY=%d",
             user_id,
@@ -394,12 +549,15 @@ async def _upload_external(
         await responder.send_error(f"No se pudo subir el video: {str(exc)[:300]}")
         return
 
-    _upload_limiter.consume(user_id)
+    if count_quota:
+        _upload_limiter.consume(user_id)
     logger.info(
         "Subida externa completada en %.2f s (%s)",
         time.perf_counter() - start,
         upload.provider,
     )
+    if cache_key is not None:
+        await _store_in_cache(final, cache_key, max_bytes, upload)
     await responder.send_result(final, recompressed=recompressed, upload=upload)
 
 
@@ -415,6 +573,9 @@ async def run_video_flow(
 
     Fase 1: el trabajo pasa por services/video_queue.py (prioridad, timeout,
     un trabajo por usuario). La lógica de descarga/recompresión no cambia.
+
+    Fase 3: si la URL es de YouTube y hay acierto en caché, se responde de
+    inmediato SIN pasar por la cola (el cooldown ya se respetó antes).
     """
     logger.info(
         "Origen=%s usuario=%s canal=%s dominio=%s límite=%.1f MB",
@@ -424,6 +585,15 @@ async def run_video_flow(
         urlparse(url).hostname,
         max_bytes / (1024 * 1024),
     )
+
+    # Fast path: YouTube con ID extraíble por regex (sin red).
+    yt_id = extract_youtube_id(url)
+    if yt_id is not None:
+        fast_key = _cache_key("youtube", yt_id, MODE_ATTACHMENT, _CACHE_LEVEL_ATTACHMENT)
+        if fast_key is not None and await _try_cache_hit(
+            fast_key, max_bytes, responder, user_id
+        ):
+            return
 
     async def _runner(job: Job) -> None:
         await _run_video_flow_inner(
@@ -503,13 +673,44 @@ async def _run_video_flow_inner(
 
     result: DownloadResult | None = None
     recompressed: DownloadResult | None = None
+    cache_key: tuple[str, str, str, int] | None = None
+    cache_lock: asyncio.Lock | None = None
     try:
-        result = await download_video(
-            url,
-            max_bytes=safe_bytes,
-            on_status=responder.set_status,
-            on_progress=_on_progress,
+        # Fase 3: extraer info primero para construir la clave de caché.
+        await responder.set_status("Obteniendo información del video...")
+        settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        work_dir = settings.temp_dir
+        info = await extract_info(url, work_dir)
+        extractor = info.get("extractor_key") or info.get("extractor")
+        video_id = info.get("id")
+        cache_key = _cache_key(
+            extractor, video_id, MODE_ATTACHMENT, _CACHE_LEVEL_ATTACHMENT
         )
+        if cache_key is not None:
+            cache_lock = video_cache.lock_for(cache_key)
+            if cache_lock.locked():
+                logger.info(
+                    "VideoCache: esperando a otro trabajo con la misma clave: %s",
+                    cache_key,
+                )
+            async with cache_lock:
+                if await _try_cache_hit(cache_key, max_bytes, responder, user_id):
+                    return
+                result = await download_video(
+                    url,
+                    max_bytes=safe_bytes,
+                    on_status=responder.set_status,
+                    on_progress=_on_progress,
+                    info=info,
+                )
+        else:
+            result = await download_video(
+                url,
+                max_bytes=safe_bytes,
+                on_status=responder.set_status,
+                on_progress=_on_progress,
+                info=info,
+            )
         logger.info(
             "Descarga OK: %s (%d bytes, límite adjunto seguro %d bytes)",
             result.title,
@@ -526,6 +727,8 @@ async def _run_video_flow_inner(
             )
             try:
                 await responder.send_result(result, recompressed=False, upload=None)
+                if cache_key is not None:
+                    await _store_in_cache(result, cache_key, max_bytes, None)
                 return
             except discord.HTTPException as exc:
                 if _is_attachment_too_large(exc):
@@ -538,7 +741,14 @@ async def _run_video_flow_inner(
                     )
                 else:
                     raise
-            await _upload_external(result, user_id, responder, recompressed=False)
+            await _upload_external(
+                result,
+                user_id,
+                responder,
+                recompressed=False,
+                cache_key=cache_key,
+                max_bytes=max_bytes,
+            )
             return
 
         # 2) Recomprimir una sola vez, solo si el archivo no cabe y las reglas
@@ -607,6 +817,10 @@ async def _run_video_flow_inner(
                         await responder.send_result(
                             recompressed, recompressed=True, upload=None
                         )
+                        if cache_key is not None:
+                            await _store_in_cache(
+                                recompressed, cache_key, max_bytes, None
+                            )
                         return
                     except discord.HTTPException as exc:
                         if _is_attachment_too_large(exc):
@@ -648,7 +862,12 @@ async def _run_video_flow_inner(
         )
         await responder.set_status("Subiendo a host externo...")
         await _upload_external(
-            final, user_id, responder, recompressed=final is recompressed
+            final,
+            user_id,
+            responder,
+            recompressed=final is recompressed,
+            cache_key=cache_key,
+            max_bytes=max_bytes,
         )
 
     except VideoTooLongError as exc:
@@ -685,8 +904,16 @@ async def _run_video_flow_inner(
             f"Error inesperado: {type(exc).__name__}: {str(exc)[:200]}"
         )
     finally:
+        if cache_lock is not None and cache_key is not None:
+            video_cache.release_lock(cache_key)
         for item in (result, recompressed):
             if item is not None:
+                # No borrar si el archivo ya vive en CACHE_DIR (Fase 3).
+                try:
+                    if item.path.parent.resolve() == settings.cache_dir.resolve():
+                        continue
+                except OSError:
+                    pass
                 item.path.unlink(missing_ok=True)
 
 
