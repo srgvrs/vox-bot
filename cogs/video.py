@@ -969,26 +969,33 @@ async def _run_video_flow_inner(
         )
 
     except VideoTooLongError as exc:
-        logger.exception("Video demasiado largo")
+        logger.warning("Video demasiado largo: %s", exc)
         await responder.send_error(str(exc))
+        await responder.close("error")
     except VideoRestrictedError as exc:
-        logger.exception("Video restringido")
+        logger.warning("Video restringido: %s", exc)
         await responder.send_error(str(exc))
+        await responder.close("error")
     except VideoUnsupportedError as exc:
-        logger.exception("Video no soportado")
+        logger.warning("Video no soportado: %s", exc)
         await responder.send_error(str(exc))
+        await responder.close("error")
     except VideoNetworkError as exc:
-        logger.exception("Error de red al descargar el video")
+        logger.warning("Error de red al descargar el video: %s", exc)
         await responder.send_error(str(exc))
+        await responder.close("error")
     except VideoLoginRequiredError as exc:
-        logger.exception("El origen exige iniciar sesión")
+        logger.warning("El origen exige iniciar sesión: %s", exc)
         await responder.send_error(str(exc))
+        await responder.close("error")
     except VideoUnavailableError as exc:
-        logger.exception("Video no disponible")
+        logger.warning("Video no disponible: %s", exc)
         await responder.send_error(str(exc))
+        await responder.close("error")
     except VideoError as exc:
-        logger.exception("Error de video")
+        logger.warning("Error de video: %s", exc)
         await responder.send_error(str(exc))
+        await responder.close("error")
     except asyncio.TimeoutError as exc:
         logger.exception("Timeout en /video")
         await report_error("video", exc)
