@@ -70,6 +70,26 @@ class MediaBot(commands.Bot):
         error: app_commands.AppCommandError,
     ) -> None:
         """Manejador global (tree.on_error): log + mensaje genérico con ref."""
+        if isinstance(error, app_commands.CheckFailure):
+            logging.getLogger(__name__).info(
+                "Comando %s rechazado por permisos (usuario=%s canal=%s)",
+                getattr(interaction.command, "name", "?"),
+                interaction.user.id if interaction.user else "?",
+                interaction.channel_id,
+            )
+            mensaje = "Solo los administradores pueden usar este comando."
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(mensaje, ephemeral=True)
+                else:
+                    await interaction.response.send_message(
+                        mensaje, ephemeral=True
+                    )
+            except discord.HTTPException:
+                logging.getLogger(__name__).debug(
+                    "No se pudo responder al CheckFailure"
+                )
+            return
         ref = new_error_ref()
         logging.getLogger(__name__).exception(
             "Error no controlado en comando %s (ref=%s) usuario=%s canal=%s",

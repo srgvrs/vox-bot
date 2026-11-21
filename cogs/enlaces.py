@@ -2,6 +2,7 @@
 import logging
 import re
 import time
+import unicodedata
 
 import discord
 from discord.ext import commands
@@ -11,10 +12,34 @@ from cogs.video import MessageResponder, check_cooldown, run_video_flow
 from config import settings
 from media.downloader import _host_allowed
 from utils.errors import UNEXPECTED_ERROR_MESSAGE, new_error_ref, report_error
+from utils.mensajes_store import store as mensajes_store
+from utils.permisos import es_admin
 
 logger = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+
+# Frases de activar/desactivar mensajes (sin acentos, minúsculas).
+_ACTIVAR_PHRASES = ("activa mensajes", "enciende mensajes")
+_DESACTIVAR_PHRASES = ("desactiva mensajes", "apaga mensajes")
+
+
+def _normalize(text: str) -> str:
+    """Minúsculas y sin acentos, para comparar frases."""
+    decomposed = unicodedata.normalize("NFKD", text.lower())
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+def _detect_toggle(text: str) -> bool | None:
+    """Devuelve True (activar), False (desactivar) o None si no aplica."""
+    norm = _normalize(text)
+    for phrase in _ACTIVAR_PHRASES:
+        if phrase in norm:
+            return True
+    for phrase in _DESACTIVAR_PHRASES:
+        if phrase in norm:
+            return False
+    return None
 
 # Anti-spam del aviso de error inesperado: máx. 1 por usuario cada 60 s.
 _UNEXPECTED_NOTICE_INTERVAL_S = 60
@@ -54,6 +79,31 @@ def _guild_allowed(guild: discord.Guild | None) -> bool:
 class Enlaces(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    async def _handle_toggle(
+        self, message: discord.Message, activar: bool
+    ) -> None:
+        """Aplica el interruptor global de mensajes desde una mención."""
+        if not es_admin(message.author, message.guild):
+            await message.reply(
+                "Solo los administradores pueden hacer eso.",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        await mensajes_store.set_global_enabled(activar)
+        estado = "activado" if activar else "desactivado"
+        logger.info(
+            "Interruptor de mensajes %s por mención (usuario=%s canal=%s)",
+            estado,
+            message.author.id,
+            message.channel.id,
+        )
+        await message.reply(
+            f"Interruptor de mensajes: {estado}.",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -95,7 +145,7 @@ class Enlaces(commands.Cog):
                     url,
                 )
             else:
-                # Sin URLs: si hay texto, va al chat; si está vacía, aviso.
+                # Sin URLs: probar frases de activar/desactivar mensajes.
                 text_only = message.content
                 if self.bot.user is not None:
                     for mention in (
@@ -103,6 +153,10 @@ class Enlaces(commands.Cog):
                         f"<@!{self.bot.user.id}>",
                     ):
                         text_only = text_only.replace(mention, " ")
+                toggle = _detect_toggle(text_only)
+                if toggle is not None:
+                    await self._handle_toggle(message, toggle)
+                    return
                 if not text_only.strip():
                     logger.info(
                         "Mención vacía (usuario=%s canal=%s)",
