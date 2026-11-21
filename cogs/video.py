@@ -31,6 +31,7 @@ from media.downloader import (
 )
 from media.storage import StorageChain, StorageError, UploadResult
 from utils.enlace_video import texto_enlace
+from utils.limpieza_temp import borrar_carpeta_trabajo
 from services.video_cache import (
     MODE_ATTACHMENT,
     MODE_HOST,
@@ -1084,6 +1085,7 @@ async def _run_video_flow_inner(
                 except OSError:
                     pass
                 item.path.unlink(missing_ok=True)
+                borrar_carpeta_trabajo(item.path)
 
 
 class Video(commands.Cog):
