@@ -1071,6 +1071,21 @@ def _map_ytdlp_error(
     host = (urlparse(url).hostname or "").lower() if url else ""
     is_x = host == "x.com" or host.endswith(".x.com") or host == "twitter.com" or host.endswith(".twitter.com")
     is_tiktok = host == "tiktok.com" or host.endswith(".tiktok.com")
+    logger.warning(
+        "yt-dlp error original [%s]: %s",
+        host or "?",
+        (str(exc).strip().splitlines() or [""])[0][:300],
+    )
+    is_youtube = (
+        host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+    )
+    if is_youtube and (
+        "not a bot" in msg or "429" in msg or "too many requests" in msg
+    ):
+        return VideoLoginRequiredError(
+            "YouTube bloqueó la descarga (verificación anti-bot o límite de "
+            "peticiones); intenta de nuevo más tarde."
+        )
 
     if "timed out" in msg or "timeout" in msg:
         return VideoNetworkError(
@@ -1094,8 +1109,12 @@ def _map_ytdlp_error(
             return VideoLoginRequiredError(
                 "Requiere iniciar sesión; no se puede descargar."
             )
+        if "instagram.com" in host:
+            return VideoLoginRequiredError(
+                "Instagram pide iniciar sesión para este contenido; no se puede descargar."
+            )
         return VideoLoginRequiredError(
-            "Instagram pide iniciar sesión para este contenido; no se puede descargar."
+            "Requiere iniciar sesión; no se puede descargar."
         )
     if "requested format is not available" in msg:
         return VideoUnavailableError(
