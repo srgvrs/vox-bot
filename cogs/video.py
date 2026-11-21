@@ -295,20 +295,22 @@ class MessageResponder:
         self.delete_original = settings.delete_original_message
         self.author_label = f"Pedido por {message.author.display_name}"
         self._closed = False
+        self._reply_lock = asyncio.Lock()
 
     async def _ensure_reply(self, content: str) -> discord.Message:
-        if self.reply is None:
-            if self.delete_original:
-                self.reply = await self.message.channel.send(
-                    content,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            else:
-                self.reply = await self.message.reply(
-                    content,
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+        async with self._reply_lock:
+            if self.reply is None:
+                if self.delete_original:
+                    self.reply = await self.message.channel.send(
+                        content,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                else:
+                    self.reply = await self.message.reply(
+                        content,
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
         return self.reply
 
     async def _delete_original(self) -> None:
