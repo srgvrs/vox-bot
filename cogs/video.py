@@ -222,7 +222,9 @@ class InteractionResponder:
         embed.set_footer(
             text=f"{origen} (caduca en {upload.expiry_hours} h) · {size_mb:.1f} MB"
         )
-        texto = texto_enlace(upload, result.title or "Video", size_mb)
+        texto = texto_enlace(
+            upload, result.title or "Video", size_mb, duration=result.duration
+        )
         if texto is not None:
             await self._publish_texto(texto)
             return
@@ -454,7 +456,13 @@ class MessageResponder:
             footer = f"{footer} · {self.author_label}"
         embed.set_footer(text=footer)
         extra = self.author_label if self.delete_original else None
-        texto = texto_enlace(upload, result.title or "Video", size_mb, extra)
+        texto = texto_enlace(
+            upload,
+            result.title or "Video",
+            size_mb,
+            extra,
+            duration=result.duration,
+        )
         if texto is not None:
             await self._publish_texto(reply, texto)
             await self._delete_original()
