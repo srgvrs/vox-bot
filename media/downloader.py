@@ -4,7 +4,6 @@ import ipaddress
 import logging
 import shutil
 import socket
-import subprocess
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -15,6 +14,7 @@ from urllib.parse import urlparse
 import yt_dlp
 
 from config import settings
+from services.proc import ProcError, ProcTimeout, run_ffmpeg, run_ffprobe
 
 try:
     from yt_dlp.networking.impersonate import ImpersonateTarget
@@ -26,7 +26,9 @@ except Exception:  # pragma: no cover - depende de curl_cffi
 
 logger = logging.getLogger(__name__)
 
-_semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
+# La concurrencia la controla services/video_queue.py (Fase 1).
+# TODO(Fase 2): migrar yt_dlp.YoutubeDL (API Python) a CLI para poder matar
+# el árbol de procesos en timeout. Un hilo no se puede interrumpir.
 
 
 class VideoError(Exception):
@@ -343,16 +345,14 @@ def _pick_instagram_short_side(
     return chosen, audio, _short_side(chosen) or 0, chosen_size
 
 
-def _probe_duration(path: Path) -> float | None:
+async def _probe_duration(path: Path) -> float | None:
     """Mide la duración del archivo con ffprobe; None si no se puede."""
-    ffprobe = shutil.which("ffprobe")
-    if ffprobe is None:
+    if shutil.which("ffprobe") is None:
         logger.warning("ffprobe no está disponible; no se puede medir la duración.")
         return None
     try:
-        proc = subprocess.run(
+        result = await run_ffprobe(
             [
-                ffprobe,
                 "-v",
                 "error",
                 "-show_entries",
@@ -361,19 +361,20 @@ def _probe_duration(path: Path) -> float | None:
                 "csv=p=0",
                 str(path),
             ],
-            capture_output=True,
-            text=True,
             timeout=15,
         )
-    except Exception as exc:
+    except ProcTimeout:
+        logger.warning("ffprobe excedió el timeout al medir la duración.")
+        return None
+    except ProcError as exc:
         logger.warning("ffprobe falló al medir la duración: %s", exc)
         return None
-    if proc.returncode != 0:
+    if result.returncode != 0:
         logger.warning(
-            "ffprobe devolvió código %d al medir la duración", proc.returncode
+            "ffprobe devolvió código %d al medir la duración", result.returncode
         )
         return None
-    raw = (proc.stdout or "").strip().splitlines()
+    raw = (result.stdout or "").strip().splitlines()
     if not raw:
         return None
     try:
@@ -409,14 +410,18 @@ def _notify(
         logger.debug("No se pudo programar el estado: %s", text)
 
 
-def _download_sync(
+async def _download_sync(
     url: str,
     out_path: Path,
     max_bytes: int | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[Path, str, float | None, int, str | None, str | None]:
-    """Descarga bloqueante (se ejecuta en un hilo).
+    """Descarga el video (async).
+
+    TODO(Fase 2): yt_dlp.YoutubeDL usa la API Python y corre en un hilo que
+    no se puede matar. Migrar a CLI (yt-dlp -J + --load-info-json) para que
+    el timeout de la cola pueda matar el árbol de procesos.
 
     Devuelve (ruta, título, duración, altura_usada, thumbnail, aviso).
     """
@@ -441,8 +446,9 @@ def _download_sync(
             logger.warning("TikTok puede fallar sin curl_cffi")
 
     # 1) Comprobar duración antes de descargar.
-    with yt_dlp.YoutubeDL({**ydl_opts, "skip_download": True}) as ydl:
-        info = ydl.extract_info(url, download=False)
+    # TODO(Fase 2): migrar a `yt-dlp -J --no-playlist URL` (CLI) para poder
+    # matar el proceso en timeout. Hoy corre en un hilo no interrumpible.
+    info = await asyncio.to_thread(_extract_info_sync, url, ydl_opts)
     if not isinstance(info, dict):
         raise VideoUnavailableError("No se pudo leer la información del video.")
 
@@ -486,11 +492,11 @@ def _download_sync(
     )
 
     # 2) Intentar un formato que ya quepa en max_bytes (evita recomprimir).
+    # TODO(Fase 2): migrar a CLI para poder matar el proceso en timeout.
     if max_bytes:
         small_opts = {**ydl_opts, "format": _build_small_format(max_bytes)}
         try:
-            with yt_dlp.YoutubeDL(small_opts) as ydl:
-                ydl.download([url])
+            await asyncio.to_thread(_download_sync_ytdlp, url, small_opts)
             candidates = list(out_path.parent.glob(f"{out_path.stem}.*"))
             if candidates and candidates[0].stat().st_size <= max_bytes:
                 logger.info(
@@ -569,9 +575,9 @@ def _download_sync(
         fmt = _build_format(height)
 
     # 4) Descargar con el formato elegido (contenedor mp4).
+    # TODO(Fase 2): migrar a CLI para poder matar el proceso en timeout.
     _notify(loop, on_status, f"Descargando video ({height}p)...")
-    with yt_dlp.YoutubeDL({**ydl_opts, "format": fmt}) as ydl:
-        ydl.download([url])
+    await asyncio.to_thread(_download_sync_ytdlp, url, {**ydl_opts, "format": fmt})
 
     # 5) Localizar el archivo final (la extensión puede variar tras el merge).
     candidates = list(out_path.parent.glob(f"{out_path.stem}.*"))
@@ -579,7 +585,7 @@ def _download_sync(
         raise VideoUnavailableError("No se pudo descargar el video.")
     final_path = candidates[0]
     if duration is None:
-        probed = _probe_duration(final_path)
+        probed = await _probe_duration(final_path)
         if probed is not None:
             duration = probed
             logger.info("Duración medida con ffprobe: %.1fs", duration)
@@ -601,6 +607,24 @@ def _download_sync(
             max_bytes / (1024 * 1024),
         )
     return final_path, title, duration, height, thumbnail, notice
+
+
+def _extract_info_sync(url: str, ydl_opts: dict) -> dict | None:
+    """Extrae info con la API Python de yt-dlp (hilo no interrumpible).
+
+    TODO(Fase 2): reemplazar por `yt-dlp -J --no-playlist URL` (CLI).
+    """
+    with yt_dlp.YoutubeDL({**ydl_opts, "skip_download": True}) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def _download_sync_ytdlp(url: str, ydl_opts: dict) -> None:
+    """Descarga con la API Python de yt-dlp (hilo no interrumpible).
+
+    TODO(Fase 2): reemplazar por CLI para poder matar el árbol en timeout.
+    """
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
 
 
 class _YdlLogger:
@@ -702,17 +726,15 @@ async def download_video(
 
     start = time.perf_counter()
     loop = asyncio.get_running_loop()
-    async with _semaphore:
-        try:
-            # yt-dlp y ffmpeg son bloqueantes: se ejecutan en un hilo para no
-            # congelar el event loop (y la animación del estado).
-            path, title, duration, height, thumbnail, notice = await asyncio.to_thread(
-                _download_sync, url, out_path, max_bytes, loop, on_status
-            )
-        except VideoError:
-            raise
-        except yt_dlp.utils.DownloadError as exc:
-            raise _map_ytdlp_error(exc, url) from exc
+    # La concurrencia la controla services/video_queue.py (Fase 1).
+    try:
+        path, title, duration, height, thumbnail, notice = await _download_sync(
+            url, out_path, max_bytes, loop, on_status
+        )
+    except VideoError:
+        raise
+    except yt_dlp.utils.DownloadError as exc:
+        raise _map_ytdlp_error(exc, url) from exc
     logger.info("Descarga completada en %.2f s", time.perf_counter() - start)
 
     size = path.stat().st_size
@@ -733,29 +755,23 @@ _qsv_available: bool | None = None
 _qsv_failed_runtime: bool = False
 
 
-def _has_qsv() -> bool:
+async def _has_qsv() -> bool:
     """Detecta h264_qsv una sola vez y lo cachea."""
     global _qsv_available
     if _qsv_available is not None:
         return _qsv_available
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is None:
+    if shutil.which("ffmpeg") is None:
         _qsv_available = False
         return False
     try:
-        proc = subprocess.run(
-            [ffmpeg, "-hide_banner", "-encoders"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        _qsv_available = "h264_qsv" in (proc.stdout or "")
-    except Exception:
+        result = await run_ffmpeg(["-hide_banner", "-encoders"], timeout=10)
+        _qsv_available = "h264_qsv" in (result.stdout or "")
+    except (ProcError, ProcTimeout):
         _qsv_available = False
     return _qsv_available
 
 
-def _should_use_qsv() -> bool:
+async def _should_use_qsv() -> bool:
     """Decide si usar h264_qsv según ENCODER y el historial de fallos."""
     encoder = settings.encoder
     if encoder == "libx264":
@@ -765,7 +781,7 @@ def _should_use_qsv() -> bool:
     # auto: usar QSV solo si está disponible y no ha fallado antes.
     if _qsv_failed_runtime:
         return False
-    return _has_qsv()
+    return await _has_qsv()
 
 
 def _pick_height(video_kbps: int, original_height: int | None) -> int:
@@ -781,7 +797,7 @@ def _pick_height(video_kbps: int, original_height: int | None) -> int:
     return height
 
 
-def _recompress_sync(
+async def _recompress_sync(
     src: Path,
     dst: Path,
     target_bytes: int,
@@ -795,12 +811,11 @@ def _recompress_sync(
     Devuelve el bitrate de video usado (kbps). Si force_encoder es "libx264",
     se salta la detección de QSV y se usa libx264 con el bitrate indicado.
     """
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is None:
+    if shutil.which("ffmpeg") is None:
         raise RecompressError("ffmpeg no está disponible.")
 
     # Margen de seguridad: 20% con QSV (menos preciso), 10% con libx264.
-    use_qsv = force_encoder is None and _should_use_qsv()
+    use_qsv = force_encoder is None and await _should_use_qsv()
     margin = 0.80 if use_qsv else 0.90
 
     audio_kbps = 64
@@ -828,9 +843,8 @@ def _recompress_sync(
 
     timeout_s = settings.recompress_timeout_s
 
-    def _run(encoder: str, extra: list[str]) -> bool:
-        cmd = [
-            ffmpeg,
+    async def _run(encoder: str, extra: list[str]) -> bool:
+        args = [
             "-y",
             "-i",
             str(src),
@@ -853,55 +867,37 @@ def _recompress_sync(
             "+faststart",
             str(dst),
         ]
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
         try:
-            try:
-                _, stderr = proc.communicate(timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                # Timeout: matar ffmpeg y limpiar el temporal.
-                logger.warning(
-                    "Recompresión con %s excedió RECOMPRESS_TIMEOUT_S=%d; "
-                    "terminando ffmpeg.",
-                    encoder,
-                    timeout_s,
-                )
-                proc.kill()
-                try:
-                    proc.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    logger.warning("ffmpeg no terminó tras kill; se continúa.")
-                raise RecompressError(
-                    f"Recompresión excedió el tiempo máximo ({timeout_s} s)."
-                )
-        except KeyboardInterrupt:
-            # Cierre ordenado: terminar ffmpeg y limpiar el temporal.
-            logger.warning("SIGINT durante la recompresión; terminando ffmpeg.")
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            raise
-        finally:
-            # Nunca dejar el temporal parcial si algo falló.
-            if proc.returncode is None or proc.returncode != 0:
-                dst.unlink(missing_ok=True)
-        if proc.returncode != 0:
-            tail = (stderr or "").strip().splitlines()[-1:] or ["error desconocido"]
-            logger.warning("Encoder %s falló: %s", encoder, tail[0][:200])
+            result = await run_ffmpeg(args, timeout=timeout_s)
+        except ProcTimeout:
+            logger.warning(
+                "Recompresión con %s excedió RECOMPRESS_TIMEOUT_S=%d; "
+                "árbol de procesos terminado.",
+                encoder,
+                timeout_s,
+            )
+            dst.unlink(missing_ok=True)
+            raise RecompressError(
+                f"Recompresión excedió el tiempo máximo ({timeout_s} s)."
+            )
+        except ProcError as exc:
+            logger.warning("Recompresión con %s falló: %s", encoder, exc)
+            dst.unlink(missing_ok=True)
             return False
-        return dst.exists() and dst.stat().st_size > 0
+        if result.returncode != 0:
+            tail = (result.stderr or "").strip().splitlines()[-1:] or ["error desconocido"]
+            logger.warning("Encoder %s falló: %s", encoder, tail[0][:200])
+            dst.unlink(missing_ok=True)
+            return False
+        if not dst.exists() or dst.stat().st_size <= 0:
+            dst.unlink(missing_ok=True)
+            return False
+        return True
 
     global _qsv_failed_runtime
     if use_qsv:
         logger.info("Recompresión usando encoder h264_qsv")
-        if _run("h264_qsv", []):
+        if await _run("h264_qsv", []):
             return video_kbps
         _qsv_failed_runtime = True
         logger.warning(
@@ -909,7 +905,7 @@ def _recompress_sync(
         )
 
     logger.info("Recompresión usando encoder libx264 (preset veryfast)")
-    if not _run("libx264", ["-preset", "veryfast"]):
+    if not await _run("libx264", ["-preset", "veryfast"]):
         raise RecompressError("Falló la recompresión con libx264.")
     return video_kbps
 
@@ -934,8 +930,7 @@ async def recompress_video(
     dst = result.path.with_name(f"{result.path.stem}_rc.mp4")
     start = time.perf_counter()
     try:
-        video_kbps = await asyncio.to_thread(
-            _recompress_sync,
+        video_kbps = await _recompress_sync(
             result.path,
             dst,
             target_bytes,
@@ -944,7 +939,7 @@ async def recompress_video(
         )
     except RecompressError:
         raise
-    except (KeyboardInterrupt, asyncio.CancelledError):
+    except asyncio.CancelledError:
         # Cierre ordenado: borrar el temporal parcial y propagar.
         dst.unlink(missing_ok=True)
         raise
@@ -991,8 +986,7 @@ async def recompress_video(
             target_bytes,
         )
         try:
-            await asyncio.to_thread(
-                _recompress_sync,
+            await _recompress_sync(
                 result.path,
                 dst,
                 target_bytes,

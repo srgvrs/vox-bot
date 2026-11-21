@@ -17,6 +17,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import settings
+from services.video_queue import video_queue
 from utils.errors import UNEXPECTED_ERROR_MESSAGE, new_error_ref, report_error
 
 COGS = [
@@ -41,6 +42,7 @@ class MediaBot(commands.Bot):
     async def setup_hook(self) -> None:
         for cog in COGS:
             await self.load_extension(cog)
+        await video_queue.start()
         _log_admin_ids()
         await _log_versions()
         self.tree.on_error = self._on_tree_error
@@ -371,36 +373,13 @@ async def _log_versions() -> None:
         )
 
 
-async def _wait_active_downloads(timeout: float) -> None:
-    """Espera a que el semáforo de descargas quede libre (hasta timeout)."""
-    try:
-        from media.downloader import _semaphore
-
-        async def _acquire_all() -> None:
-            # Adquiere todos los slots para asegurar que no hay descargas activas.
-            acquired = 0
-            try:
-                while acquired < _semaphore._value + acquired:
-                    await _semaphore.acquire()
-                    acquired += 1
-            finally:
-                for _ in range(acquired):
-                    _semaphore.release()
-
-        await asyncio.wait_for(_acquire_all(), timeout=timeout)
-    except asyncio.TimeoutError:
-        logging.warning(
-            "Cierre: se agotó el tiempo de espera (%ss) para descargas activas.",
-            timeout,
-        )
-    except Exception as exc:
-        logging.debug("Cierre: no se pudo esperar descargas activas: %s", exc)
-
-
 async def _shutdown(bot: MediaBot) -> None:
-    """Cierre limpio: espera descargas, limpia TEMP_DIR y cierra el bot."""
-    logging.info("Cierre solicitado; esperando descargas activas...")
-    await _wait_active_downloads(_SHUTDOWN_TIMEOUT_SECONDS)
+    """Cierre limpio: cierra la cola, limpia TEMP_DIR y cierra el bot."""
+    logging.info("Cierre solicitado; cerrando la cola de video...")
+    try:
+        await video_queue.stop()
+    except Exception as exc:
+        logging.warning("Error al cerrar la cola de video: %s", exc)
     _cleanup_temp_dir()
     try:
         await bot.close()

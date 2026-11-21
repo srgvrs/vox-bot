@@ -84,6 +84,13 @@ class Settings:
     # Valor efectivo si está definido, si no el default 20.
     upload_limit_mb: int = discord_upload_limit_mb or 20
     max_concurrent_downloads: int = _int("MAX_CONCURRENT_DOWNLOADS", 2)
+    # Cola de video (Fase 1). VIDEO_WORKERS por defecto = MAX_CONCURRENT_DOWNLOADS.
+    video_workers: int = _int(
+        "VIDEO_WORKERS", _int("MAX_CONCURRENT_DOWNLOADS", 2)
+    )
+    video_max_cola: int = _int("VIDEO_MAX_COLA", 5)
+    video_timeout_s: int = _int("VIDEO_TIMEOUT_S", 180)
+    video_timeout_largo_s: int = _int("VIDEO_TIMEOUT_LARGO_S", 900)
     max_uploads_per_user_day: int = _int("MAX_UPLOADS_PER_USER_DAY", 10)
     temp_dir: Path = Path(os.getenv("TEMP_DIR", "temp"))
 

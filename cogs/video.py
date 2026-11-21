@@ -26,6 +26,14 @@ from media.downloader import (
     recompress_video,
 )
 from media.storage import StorageChain, StorageError, UploadResult
+from services.video_queue import (
+    Job,
+    JobTimeout,
+    QueueClosed,
+    QueueFull,
+    UserBusy,
+    video_queue,
+)
 from utils.errors import UNEXPECTED_ERROR_MESSAGE, new_error_ref, report_error
 from utils.ratelimit import DailyUserLimiter
 from utils.status import StatusMessage
@@ -395,7 +403,11 @@ async def run_video_flow(
     origin: str,
     channel_id: int | None = None,
 ) -> None:
-    """Flujo reutilizable de /video: descarga, recompresión y envío."""
+    """Flujo reutilizable de /video: descarga, recompresión y envío.
+
+    Fase 1: el trabajo pasa por services/video_queue.py (prioridad, timeout,
+    un trabajo por usuario). La lógica de descarga/recompresión no cambia.
+    """
     logger.info(
         "Origen=%s usuario=%s canal=%s dominio=%s límite=%.1f MB",
         origin,
@@ -404,6 +416,57 @@ async def run_video_flow(
         urlparse(url).hostname,
         max_bytes / (1024 * 1024),
     )
+
+    async def _runner(job: Job) -> None:
+        await _run_video_flow_inner(
+            url, user_id, responder, max_bytes, origin, channel_id
+        )
+
+    async def _on_timeout(job: Job) -> None:
+        logger.warning(
+            "Timeout de video: usuario=%s canal=%s url=%s",
+            user_id,
+            channel_id,
+            url,
+        )
+        try:
+            await responder.send_error(
+                "El video tardó demasiado y se canceló. Intenta de nuevo."
+            )
+        except Exception:
+            logger.exception("No se pudo avisar del timeout")
+
+    job = Job(
+        user_id=user_id,
+        channel_id=channel_id,
+        url=url,
+        priority=0,
+        timeout_s=float(settings.video_timeout_s),
+        runner=_runner,
+        on_timeout=_on_timeout,
+    )
+    try:
+        await video_queue.submit(job)
+    except UserBusy:
+        await responder.send_error("Ya tienes un video en proceso.")
+    except QueueFull:
+        await responder.send_error("Ocupado, intenta en un momento")
+    except QueueClosed:
+        await responder.send_error("El bot se está reiniciando")
+    except JobTimeout:
+        # on_timeout ya avisó al usuario.
+        pass
+
+
+async def _run_video_flow_inner(
+    url: str,
+    user_id: int,
+    responder: Responder,
+    max_bytes: int,
+    origin: str,
+    channel_id: int | None = None,
+) -> None:
+    """Cuerpo original del flujo (sin cambios de lógica)."""
 
     # Margen de seguridad: Discord rechaza adjuntos que rozan el límite.
     safe_bytes = int(max_bytes * _ATTACHMENT_SAFETY_MARGIN)
