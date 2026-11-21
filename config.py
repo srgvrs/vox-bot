@@ -119,6 +119,7 @@ class Settings:
     tmpfiles_expiry_hours: int = _int("TMPFILES_EXPIRY_HOURS", 24)
     worker_url: str = os.getenv("WORKER_URL", "").strip()
     worker_secret: str = os.getenv("WORKER_SECRET", "").strip()
+    worker_umbral_min: int = _int("WORKER_UMBRAL_MIN", 30)
     storage_timeout_seconds: int = _int("STORAGE_TIMEOUT_SECONDS", 60)
     storage_max_retries: int = _int("STORAGE_MAX_RETRIES", 2)
     storage_circuit_seconds: int = _int("STORAGE_CIRCUIT_SECONDS", 300)

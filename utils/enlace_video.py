@@ -23,6 +23,7 @@ def texto_enlace(
     titulo: str,
     size_mb: float,
     extra: str | None = None,
+    duration: float | None = None,
 ) -> str | None:
     proveedor = upload.provider.strip().lower()
     info = (
@@ -32,10 +33,16 @@ def texto_enlace(
     if extra:
         info += f" · {extra}"
 
-    if proveedor in _DIRECTOS:
+    worker_ok = bool(settings.worker_url and settings.worker_secret)
+    largo = (
+        duration is not None
+        and settings.worker_umbral_min > 0
+        and duration >= settings.worker_umbral_min * 60
+    )
+    if proveedor in _DIRECTOS and not (largo and worker_ok):
         return f"{upload.url}\n{info}"
 
-    if proveedor in _CON_WORKER and settings.worker_url and settings.worker_secret:
+    if (proveedor in _CON_WORKER or proveedor in _DIRECTOS) and worker_ok:
         t = titulo[:100]
         s = firmar(settings.worker_secret, upload.url, t)
         enlace = (
