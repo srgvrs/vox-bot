@@ -311,6 +311,7 @@ class MessageResponder:
                         mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
+                logger.info("Estado CREADO id=%s texto=%s", self.reply.id, content)
         return self.reply
 
     async def _delete_original(self) -> None:
@@ -339,6 +340,7 @@ class MessageResponder:
 
     async def set_status(self, texto: str) -> None:
         if self._closed:
+            logger.info("set_status ignorado (cerrado): %s", texto)
             return
         reply = await self._ensure_reply(texto)
         try:
@@ -363,6 +365,7 @@ class MessageResponder:
                 await asyncio.sleep(delay)
             if self.reply is not None:
                 await self.reply.delete()
+                logger.info("Estado BORRADO id=%s", self.reply.id)
             logger.info(
                 "Estado eliminado (usuario=%s, motivo=%s)",
                 self.message.author.id,
