@@ -106,6 +106,36 @@ class TmpfilesProvider(StorageProvider):
         return url.replace("tmpfiles.org/", "tmpfiles.org/dl/", 1)
 
 
+class UguuProvider(StorageProvider):
+    """uguu.se (temporal; enlace directo, Discord lo reproduce)."""
+
+    name = "uguu.se"
+    max_bytes = 100 * 1024 * 1024  # provisional, sin verificar
+    expiry_hours = 48  # provisional, sin verificar
+    _API = "https://uguu.se/upload"
+
+    async def upload(self, session: aiohttp.ClientSession, path: Path) -> str:
+        if path.stat().st_size > self.max_bytes:
+            raise StorageError("uguu.se: archivo supera 100 MB.")
+        form = aiohttp.FormData()
+        with path.open("rb") as fh:
+            form.add_field(
+                "files[]",
+                fh,
+                filename=path.name,
+                content_type="application/octet-stream",
+            )
+            async with session.post(self._API, data=form) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status != 200 or not data.get("success"):
+                    raise StorageError(f"uguu.se respondió {resp.status}.")
+        files = data.get("files") or []
+        url = files[0].get("url") if files else None
+        if not url:
+            raise StorageError("uguu.se no devolvió URL.")
+        return url
+
+
 class StorageToProvider(StorageProvider):
     """storage.to (flujo init -> PUT -> confirm)."""
 
@@ -190,6 +220,7 @@ def _parse_litterbox_expiry(value: str) -> int:
 
 _PROVIDERS: dict[str, type[StorageProvider]] = {
     "litterbox": LitterboxProvider,
+    "uguu": UguuProvider,
     "tmpfiles": TmpfilesProvider,
     "storage_to": StorageToProvider,
     "gofile": GoFileProvider,

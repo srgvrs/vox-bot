@@ -109,7 +109,7 @@ class Settings:
     storage_providers: tuple[str, ...] = tuple(
         x.strip().lower()
         for x in os.getenv(
-            "STORAGE_PROVIDERS", "litterbox,tmpfiles,storage_to,gofile"
+            "STORAGE_PROVIDERS", "uguu,litterbox,tmpfiles,storage_to,gofile"
         ).split(",")
         if x.strip()
     )
