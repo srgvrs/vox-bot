@@ -134,6 +134,13 @@ class Settings:
 
     # Estado animado de /video (formato <a:nombre:id> o vacío para spinner)
     status_emoji: str = os.getenv("STATUS_EMOJI", "")
+    # 1 = lista de pasos detallada; 0 = spinner simple
+    status_detalle: bool = os.getenv("STATUS_DETALLE", "1").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
     # Modo automático de enlaces (desactivado por defecto)
     auto_link_enabled: bool = os.getenv("AUTO_LINK_ENABLED", "false").lower() in (
