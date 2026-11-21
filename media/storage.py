@@ -71,6 +71,39 @@ class LitterboxProvider(StorageProvider):
             return text
 
 
+class TmpfilesProvider(StorageProvider):
+    """tmpfiles.org (temporal, máx. 100 MB)."""
+
+    name = "tmpfiles.org"
+    max_bytes = 100 * 1024 * 1024
+    _API = "https://tmpfiles.org/api/v1/upload"
+
+    def __init__(self) -> None:
+        self.expiry_hours = min(settings.tmpfiles_expiry_hours, 48)
+
+    async def upload(self, session: aiohttp.ClientSession, path: Path) -> str:
+        if path.stat().st_size > self.max_bytes:
+            raise StorageError("tmpfiles.org: archivo supera 100 MB.")
+        form = aiohttp.FormData()
+        form.add_field("expire", str(int(self.expiry_hours * 3600)))
+        form.add_field(
+            "file",
+            path.open("rb"),
+            filename=path.name,
+            content_type="application/octet-stream",
+        )
+        async with session.post(self._API, data=form) as resp:
+            data = await resp.json()
+            if resp.status != 200 or data.get("status") != "success":
+                raise StorageError(f"tmpfiles.org respondió {resp.status}.")
+        url = (data.get("data") or {}).get("url")
+        if not url:
+            raise StorageError("tmpfiles.org no devolvió URL.")
+        if "/dl/" in url:
+            return url
+        return url.replace("tmpfiles.org/", "tmpfiles.org/dl/", 1)
+
+
 class StorageToProvider(StorageProvider):
     """storage.to (flujo init -> PUT -> confirm)."""
 
@@ -155,6 +188,7 @@ def _parse_litterbox_expiry(value: str) -> int:
 
 _PROVIDERS: dict[str, type[StorageProvider]] = {
     "litterbox": LitterboxProvider,
+    "tmpfiles": TmpfilesProvider,
     "storage_to": StorageToProvider,
     "gofile": GoFileProvider,
 }
