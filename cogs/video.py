@@ -504,8 +504,16 @@ async def _store_in_cache(
                 video_id=result.video_id,
                 notice=result.notice,
             )
-        video_cache.put(entry)
-        logger.info("VideoCache: guardado %s", key)
+        if video_cache.put(entry):
+            logger.info("VideoCache: guardado %s", key)
+        else:
+            # No se pudo cachear: borrar el archivo para no dejarlo huérfano.
+            logger.info("VideoCache: descartado %s (no se pudo cachear)", key)
+            if entry.path is not None:
+                try:
+                    entry.path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("No se pudo borrar %s: %s", entry.path, exc)
     except Exception:
         logger.exception("VideoCache: no se pudo guardar %s", key)
 
