@@ -63,9 +63,10 @@ class VideoTooLongError(VideoError):
 class LargoRequerido(VideoError):
     """El video supera el umbral de modo largo y debe procesarse como largo."""
 
-    def __init__(self, duration: float) -> None:
+    def __init__(self, duration: float, info: dict | None = None) -> None:
         super().__init__("modo largo")
         self.duration = duration
+        self.info = info
 
 
 class VideoUnavailableError(VideoError):
@@ -796,7 +797,7 @@ async def _download_sync(
             f"El video dura más de {settings.video_max_largo_min} minutos."
         )
     if duration is not None and duration > settings.video_largo_umbral_min * 60:
-        raise LargoRequerido(duration)
+        raise LargoRequerido(duration, info)
 
     webpage = (info.get("webpage_url") or url or "").lower()
     is_instagram = "instagram.com" in webpage
@@ -1126,6 +1127,50 @@ def _map_ytdlp_error(
 
 
 async def download_video(
+    url: str,
+    max_bytes: int | None = None,
+    on_status: Callable[[str], Awaitable[None]] | None = None,
+    on_progress: ProgressCallback | None = None,
+    info: dict | None = None,
+) -> DownloadResult:
+    """Descarga normal; si el video es largo, usa el modo largo."""
+    try:
+        return await _download_video_base(
+            url, max_bytes, on_status, on_progress, info
+        )
+    except LargoRequerido as exc:
+        return await _download_largo(url, exc, on_status, on_progress)
+
+
+async def _download_largo(url, exc, on_status, on_progress) -> DownloadResult:
+    from media.modo_largo import ModoLargoError, descargar_largo
+
+    info = exc.info
+    if not info:
+        raise VideoUnavailableError("No se pudo preparar el video largo.")
+    if on_status is not None:
+        await on_status(
+            f"⏳ Video largo ({int(exc.duration // 60)} min): se baja a 240p y se sube a un host"
+        )
+    carpeta = settings.temp_dir / uuid.uuid4().hex
+    try:
+        path = await descargar_largo(url, info, carpeta, on_progress)
+    except ModoLargoError as err:
+        raise VideoUnavailableError(str(err)) from err
+    return DownloadResult(
+        path=path,
+        title=_pick_title(info, path.stem),
+        recompressed=False,
+        duration=exc.duration,
+        size=path.stat().st_size,
+        thumbnail=_normalize_thumbnail(info.get("thumbnail")),
+        extractor=info.get("extractor_key") or info.get("extractor"),
+        video_id=info.get("id"),
+        mode="host",
+    )
+
+
+async def _download_video_base(
     url: str,
     max_bytes: int | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
