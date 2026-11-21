@@ -76,6 +76,10 @@ class Settings:
     recompress_max_source_mb: int = _int("RECOMPRESS_MAX_SOURCE_MB", 30)
     recompress_timeout_s: int = _int("RECOMPRESS_TIMEOUT_S", 180)
     instagram_long_reel_seconds: int = _int("INSTAGRAM_LONG_REEL_SECONDS", 60)
+    # Modo largo: videos que superan el umbral se tratan como "largos".
+    video_largo_umbral_min: int = _int("VIDEO_LARGO_UMBRAL_MIN", 15)
+    video_max_largo_min: int = _int("VIDEO_MAX_LARGO_MIN", 120)
+    video_largo_max_mb: int = _int("VIDEO_LARGO_MAX_MB", 300)
     video_cooldown_seconds: int = _int("VIDEO_COOLDOWN_SECONDS", 30)
     # None = no definido en .env (se usa el límite del servidor).
     discord_upload_limit_mb: int | None = (
