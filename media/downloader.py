@@ -60,6 +60,13 @@ class VideoTooLongError(VideoError):
     """El video supera la duración máxima permitida."""
 
 
+class LargoRequerido(VideoError):
+    """El video supera el umbral de modo largo y debe procesarse como largo."""
+
+    def __init__(self, duration: float) -> None:
+        super().__init__("modo largo")
+        self.duration = duration
+
 
 class VideoUnavailableError(VideoError):
     """El video es privado, no está disponible o la URL no es válida."""
@@ -784,10 +791,12 @@ async def _download_sync(
     thumbnail = _normalize_thumbnail(info.get("thumbnail"))
     extractor = info.get("extractor_key") or info.get("extractor")
     video_id = info.get("id")
-    if duration is not None and duration > settings.max_video_minutes * 60:
+    if duration is not None and duration > settings.video_max_largo_min * 60:
         raise VideoTooLongError(
-            f"El video dura más de {settings.max_video_minutes} minutos."
+            f"El video dura más de {settings.video_max_largo_min} minutos."
         )
+    if duration is not None and duration > settings.video_largo_umbral_min * 60:
+        raise LargoRequerido(duration)
 
     webpage = (info.get("webpage_url") or url or "").lower()
     is_instagram = "instagram.com" in webpage
