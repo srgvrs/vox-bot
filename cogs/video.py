@@ -30,6 +30,7 @@ from media.downloader import (
     recompress_video,
 )
 from media.storage import StorageChain, StorageError, UploadResult
+from utils.enlace_video import texto_enlace
 from services.video_cache import (
     MODE_ATTACHMENT,
     MODE_HOST,
@@ -221,7 +222,34 @@ class InteractionResponder:
         embed.set_footer(
             text=f"{origen} (caduca en {upload.expiry_hours} h) · {size_mb:.1f} MB"
         )
+        texto = texto_enlace(upload, result.title or "Video", size_mb)
+        if texto is not None:
+            await self._publish_texto(texto)
+            return
         await self._publish(embed=embed)
+
+    async def _publish_texto(self, texto: str) -> None:
+        """Publica solo el enlace como texto (Discord genera el reproductor)."""
+        channel = self.interaction.channel
+        if channel is not None:
+            try:
+                await channel.send(
+                    content=texto,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                try:
+                    await self.interaction.delete_original_response()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                    logger.debug("No se pudo borrar el mensaje de progreso: %s", exc)
+                return
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning("channel.send falló (%s); se usa edición de respaldo", exc)
+        await self.interaction.edit_original_response(
+            content=texto,
+            embed=None,
+            attachments=[],
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def _publish(
         self,
