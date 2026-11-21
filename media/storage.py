@@ -79,23 +79,25 @@ class TmpfilesProvider(StorageProvider):
     _API = "https://tmpfiles.org/api/v1/upload"
 
     def __init__(self) -> None:
-        self.expiry_hours = min(settings.tmpfiles_expiry_hours, 48)
+        # La API exige expire entre 60 y 172800 s (48 h).
+        self.expiry_hours = max(1, min(settings.tmpfiles_expiry_hours, 48))
 
     async def upload(self, session: aiohttp.ClientSession, path: Path) -> str:
         if path.stat().st_size > self.max_bytes:
             raise StorageError("tmpfiles.org: archivo supera 100 MB.")
         form = aiohttp.FormData()
         form.add_field("expire", str(int(self.expiry_hours * 3600)))
-        form.add_field(
-            "file",
-            path.open("rb"),
-            filename=path.name,
-            content_type="application/octet-stream",
-        )
-        async with session.post(self._API, data=form) as resp:
-            data = await resp.json()
-            if resp.status != 200 or data.get("status") != "success":
-                raise StorageError(f"tmpfiles.org respondió {resp.status}.")
+        with path.open("rb") as fh:
+            form.add_field(
+                "file",
+                fh,
+                filename=path.name,
+                content_type="application/octet-stream",
+            )
+            async with session.post(self._API, data=form) as resp:
+                data = await resp.json()
+                if resp.status != 200 or data.get("status") != "success":
+                    raise StorageError(f"tmpfiles.org respondió {resp.status}.")
         url = (data.get("data") or {}).get("url")
         if not url:
             raise StorageError("tmpfiles.org no devolvió URL.")
