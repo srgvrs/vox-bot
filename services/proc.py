@@ -124,7 +124,9 @@ async def run_ytdlp(
     args: list[str], *, timeout: float | None = None
 ) -> ProcResult:
     """Ejecuta yt-dlp con --concurrent-fragments 2 y prioridad baja."""
-    cmd = ["yt-dlp", "--concurrent-fragments", "2", *args]
+    import sys
+
+    cmd = [sys.executable, "-m", "yt_dlp", "--concurrent-fragments", "2", *args]
     return await run(cmd, timeout=timeout, low_priority=True)
 
 
