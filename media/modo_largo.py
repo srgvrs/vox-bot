@@ -97,7 +97,12 @@ def _pick_audio(formats: list[dict], duration: float | None) -> dict | None:
     audios = [f for f in formats if _is_audio_only(f) and f.get("format_id")]
     if not audios:
         return None
-    return min(audios, key=lambda f: _estimate_size(f, duration) or 0)
+    # Preferir audio sin sufijo "-drc" (dynamic range compression).
+    non_drc = [
+        f for f in audios if not str(f.get("format_id", "")).endswith("-drc")
+    ]
+    pool = non_drc or audios
+    return min(pool, key=lambda f: _estimate_size(f, duration) or 0)
 
 
 def elegir_formato_largo(
@@ -124,12 +129,28 @@ def elegir_formato_largo(
         )
         return _LARGO_FALLBACK_SELECTOR, 0.0
 
-    # Ordenar por altura descendente y luego por tbr descendente.
-    videos.sort(
-        key=lambda f: (_height(f) or 0, float(f.get("tbr") or 0)),
-        reverse=True,
-    )
-    video = videos[0]
+    # Preferir formatos https con filesize exacto y sin av01 (tamaño fiable).
+    def _exact(f: dict) -> bool:
+        fs = f.get("filesize")
+        return (
+            f.get("protocol") == "https"
+            and isinstance(fs, (int, float))
+            and fs > 0
+            and not str(f.get("vcodec") or "").startswith("av01")
+        )
+
+    exact = [f for f in videos if _exact(f)]
+    if exact:
+        top_h = max(_height(f) or 0 for f in exact)
+        at_h = [f for f in exact if (_height(f) or 0) == top_h]
+        video = min(at_h, key=lambda f: int(f["filesize"]))
+    else:
+        # Ordenar por altura descendente y luego por tbr descendente.
+        videos.sort(
+            key=lambda f: (_height(f) or 0, float(f.get("tbr") or 0)),
+            reverse=True,
+        )
+        video = videos[0]
     v_size = _estimate_size(video, duration) or 0
 
     audio = _pick_audio(formatos, duration)
