@@ -44,6 +44,7 @@ def texto_enlace(
             f"&t={quote(t, safe='')}"
             f"&s={s}"
         )
-        return f"{enlace}\n{info}"
+        etiqueta = t.replace("[", "(").replace("]", ")").replace("\n", " ").strip()
+        return f"[{etiqueta or 'Video'}]({enlace})\n{info}"
 
     return None
