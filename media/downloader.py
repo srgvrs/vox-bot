@@ -1152,6 +1152,8 @@ async def _download_largo(url, exc, on_status, on_progress) -> DownloadResult:
         await on_status(
             f"⏳ Video largo ({int(exc.duration // 60)} min): se baja a 240p y se sube a un host"
         )
+    from services.video_queue import extend_timeout
+    extend_timeout(settings.video_timeout_largo_s)
     carpeta = settings.temp_dir / uuid.uuid4().hex
     try:
         path = await descargar_largo(url, info, carpeta, on_progress)

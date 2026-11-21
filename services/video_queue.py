@@ -15,10 +15,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import contextvars
+
 from config import settings
 from services.proc import kill_tree
 
 logger = logging.getLogger(__name__)
+
+_current_timeout: contextvars.ContextVar = contextvars.ContextVar(
+    "video_timeout_cm", default=None
+)
+
+
+def extend_timeout(seconds: float) -> None:
+    cm = _current_timeout.get()
+    if cm is not None and not cm.expired():
+        cm.reschedule(asyncio.get_running_loop().time() + seconds)
 
 PRIORITY_NORMAL = 0
 PRIORITY_LARGO = 10
@@ -190,9 +202,9 @@ class VideoQueue:
                     logger.exception("on_started falló")
             close_reason = "ok"
             try:
-                result = await asyncio.wait_for(
-                    job.runner(job), timeout=job.timeout_s
-                )
+                async with asyncio.timeout(job.timeout_s) as cm:
+                    _current_timeout.set(cm)
+                    result = await job.runner(job)
                 if not job.future.done():
                     job.future.set_result(result)
             except asyncio.TimeoutError:
