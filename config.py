@@ -20,6 +20,37 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _parse_id_list(name: str) -> tuple[int, ...]:
+    """Parsea una lista de IDs separada por comas o espacios.
+
+    - Ignora elementos vacíos.
+    - Quita comillas y espacios alrededor de cada elemento.
+    - Registra en WARNING los elementos que no se pueden convertir a entero.
+    """
+    raw = os.getenv(name, "")
+    if not raw:
+        return ()
+    # Normaliza separadores: comas y espacios actúan como delimitadores.
+    tokens = raw.replace(",", " ").split()
+    ids: list[int] = []
+    invalid: list[str] = []
+    for token in tokens:
+        clean = token.strip().strip("'\"").strip()
+        if not clean:
+            continue
+        try:
+            ids.append(int(clean))
+        except ValueError:
+            invalid.append(token)
+    if invalid:
+        logger.warning(
+            "%s: elementos no numéricos ignorados: %s",
+            name,
+            ", ".join(repr(x) for x in invalid),
+        )
+    return tuple(ids)
+
+
 @dataclass(frozen=True)
 class Settings:
     discord_token: str = field(
@@ -89,11 +120,7 @@ class Settings:
     serper_daily_limit: int = _int("SERPER_DAILY_LIMIT", 50)
 
     # Administración / monitoreo
-    admin_user_ids: tuple[int, ...] = tuple(
-        int(x)
-        for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",")
-        if x.isdigit()
-    )
+    admin_user_ids: tuple[int, ...] = _parse_id_list("ADMIN_USER_IDS")
     error_webhook_url: str = field(
         default_factory=lambda: os.getenv("ERROR_WEBHOOK_URL", ""), repr=False
     )

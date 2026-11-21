@@ -41,6 +41,7 @@ class MediaBot(commands.Bot):
     async def setup_hook(self) -> None:
         for cog in COGS:
             await self.load_extension(cog)
+        _log_admin_ids()
         await _log_versions()
         self.tree.on_error = self._on_tree_error
         self.tree.error(self._on_app_command_error)
@@ -138,6 +139,37 @@ class MediaBot(commands.Bot):
                 "No se pudo responder al error del comando"
             )
 
+    @app_commands.command(
+        name="admins",
+        description="Muestra tu ID y si estás configurado como administrador",
+    )
+    async def admins(self, interaction: discord.Interaction) -> None:
+        from utils.permisos import es_admin
+
+        user_id = interaction.user.id
+        is_admin = es_admin(interaction.user, interaction.guild)
+        lineas = [
+            f"Tu ID: `{user_id}`",
+            f"Eres admin: **{'sí' if is_admin else 'no'}**",
+        ]
+        if is_admin:
+            ids = list(settings.admin_user_ids)
+            if ids:
+                lineas.append(
+                    "IDs configurados: " + ", ".join(f"<@{i}>" for i in ids)
+                )
+            else:
+                lineas.append(
+                    "IDs configurados: (ninguno; eres admin por permiso del servidor)"
+                )
+        else:
+            lineas.append(
+                f"IDs configurados: **{len(settings.admin_user_ids)}**"
+            )
+        await interaction.response.send_message(
+            "\n".join(lineas), ephemeral=True
+        )
+
     async def on_guild_join(self, guild: discord.Guild) -> None:
         if settings.allowed_guild_ids and guild.id not in settings.allowed_guild_ids:
             logging.warning(
@@ -146,6 +178,19 @@ class MediaBot(commands.Bot):
             await guild.leave()
         else:
             logging.info("Unido a guild permitido %s (%s)", guild.id, guild.name)
+
+
+def _log_admin_ids() -> None:
+    """Registra los ADMIN_USER_IDS cargados para diagnóstico."""
+    ids = list(settings.admin_user_ids)
+    if ids:
+        logging.info("ADMIN_USER_IDS cargados: %s", ids)
+    else:
+        logging.warning(
+            "ADMIN_USER_IDS está vacío: ningún usuario podrá usar comandos de "
+            "administrador (salvo quienes tengan permiso 'Administrator' en el "
+            "servidor). Define ADMIN_USER_IDS en el .env."
+        )
 
 
 def _log_synced_commands(

@@ -362,12 +362,12 @@ class _RemoveSelect(discord.ui.Select):
     def __init__(self, panel: "MensajesPanelView") -> None:
         self.panel = panel
         options = panel.build_options()
+        # Solo se instancia cuando hay opciones (ver MensajesPanelView._rebuild).
         super().__init__(
             placeholder="Quitar mensajes…",
             min_values=1,
-            max_values=max(1, len(options)),
+            max_values=len(options),
             options=options,
-            disabled=not options,
         )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -441,16 +441,22 @@ class MensajesPanelView(discord.ui.View):
         um = store.get_user(self.user_id)
         estado = "activado" if (um and um.enabled) else "desactivado"
         total = len(um.messages) if um else 0
-        return (
-            f"<@{self.user_id}>\n"
-            f"Interruptor: **{estado}**\n"
-            f"Mensajes: **{total}**"
-        )
+        lineas = [
+            f"<@{self.user_id}>",
+            f"Interruptor: **{estado}**",
+            f"Mensajes: **{total}**",
+        ]
+        if total == 0:
+            lineas.append("No hay mensajes para quitar.")
+        return "\n".join(lineas)
 
     def _rebuild(self) -> None:
         self.clear_items()
         self.add_item(_AddButton(self))
-        self.add_item(_RemoveSelect(self))
+        # Discord exige al menos una opción en un Select; solo lo agregamos
+        # si hay mensajes en la página actual.
+        if self.build_options():
+            self.add_item(_RemoveSelect(self))
         self.add_item(_ToggleButton(self))
         total_pages = self._total_pages()
         if total_pages > 1:

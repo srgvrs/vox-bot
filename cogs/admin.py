@@ -78,6 +78,11 @@ class Admin(commands.Cog):
         )
         try:
             if not _is_admin(interaction.user.id):
+                logger.info(
+                    "/estado rechazado: user_id=%s no está en ADMIN_USER_IDS=%s",
+                    interaction.user.id,
+                    list(settings.admin_user_ids),
+                )
                 await interaction.response.send_message(
                     "No tienes permiso para usar este comando.", ephemeral=True
                 )
