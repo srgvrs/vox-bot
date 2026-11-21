@@ -453,8 +453,33 @@ class MessageResponder:
         if self.delete_original:
             footer = f"{footer} · {self.author_label}"
         embed.set_footer(text=footer)
+        extra = self.author_label if self.delete_original else None
+        texto = texto_enlace(upload, result.title or "Video", size_mb, extra)
+        if texto is not None:
+            await self._publish_texto(reply, texto)
+            await self._delete_original()
+            return
         await self._publish(reply=reply, embed=embed)
         await self._delete_original()
+
+    async def _publish_texto(self, reply: discord.Message, texto: str) -> None:
+        """Publica solo el enlace como texto (Discord genera el reproductor)."""
+        try:
+            await self.message.channel.send(
+                content=texto,
+                reference=self.message.to_reference(fail_if_not_exists=False),
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("channel.send falló (%s); se edita el progreso", exc)
+        await reply.edit(
+            content=texto,
+            embed=None,
+            attachments=[],
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def _publish(
         self,
