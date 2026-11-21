@@ -512,19 +512,24 @@ async def _run_video_flow_inner(
 
         # 2) Recomprimir una sola vez, solo si el archivo no cabe y las reglas
         #    de seguridad lo permiten. Si no, se sube directo al host externo.
+        #    Fase 2: el downloader ya eligió el modo ("recompress" o "host");
+        #    si eligió "host", no se intenta recomprimir aquí.
         logger.info(
-            "El archivo pesa %.1f MB y el límite es %.1f MB (origen: %s); "
+            "El archivo pesa %.1f MB y el límite es %.1f MB (origen: %s, mode=%s); "
             "intento recomprimir",
             result.size / (1024 * 1024),
             safe_bytes / (1024 * 1024),
             origin,
+            result.mode,
         )
         duration_known = result.duration is not None and result.duration > 0
         duration_min = (result.duration or 0) / 60
         source_mb = result.size / (1024 * 1024)
         max_source_mb = settings.recompress_max_source_mb
         skip_reason: str | None = None
-        if not settings.recompress_enabled:
+        if result.mode == "host":
+            skip_reason = "el downloader eligió host externo (Fase 2)"
+        elif not settings.recompress_enabled:
             skip_reason = "RECOMPRESS_ENABLED=false (desactivada)"
         elif settings.recompress_max_minutes <= 0:
             skip_reason = "RECOMPRESS_MAX_MINUTES=0 (desactivada)"

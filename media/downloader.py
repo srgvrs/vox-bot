@@ -1,6 +1,11 @@
-"""Descarga de video con yt-dlp (+ ffmpeg)."""
+"""Descarga de video con yt-dlp (+ ffmpeg).
+
+Fase 2: una sola extracción con `yt-dlp -J --no-playlist` (CLI, matable) y
+elección de formato ANTES de descargar, con escalones de calidad.
+"""
 import asyncio
 import ipaddress
+import json
 import logging
 import shutil
 import socket
@@ -14,21 +19,26 @@ from urllib.parse import urlparse
 import yt_dlp
 
 from config import settings
-from services.proc import ProcError, ProcTimeout, run_ffmpeg, run_ffprobe
-
-try:
-    from yt_dlp.networking.impersonate import ImpersonateTarget
-
-    _IMPERSONATE_AVAILABLE = True
-except Exception:  # pragma: no cover - depende de curl_cffi
-    ImpersonateTarget = None  # type: ignore[assignment]
-    _IMPERSONATE_AVAILABLE = False
+from services.proc import (
+    ProcError,
+    ProcTimeout,
+    run_ffmpeg,
+    run_ffprobe,
+    run_ytdlp,
+)
 
 logger = logging.getLogger(__name__)
 
-# La concurrencia la controla services/video_queue.py (Fase 1).
-# TODO(Fase 2): migrar yt_dlp.YoutubeDL (API Python) a CLI para poder matar
-# el árbol de procesos en timeout. Un hilo no se puede interrumpir.
+# Margen de seguridad sobre el límite de adjunto (97%).
+_ATTACHMENT_SAFETY_MARGIN = 0.97
+# Margen sobre el tamaño estimado de cada candidato (5%).
+_SIZE_MARGIN = 1.05
+# Bitrate de audio objetivo al recompresar (kbps).
+_RECOMPRESS_AUDIO_KBPS = 64
+# Bitrate mínimo de video para que la recompresión tenga sentido (kbps).
+_RECOMPRESS_MIN_VIDEO_KBPS = 150
+# Timeout de la extracción con yt-dlp -J (segundos).
+_EXTRACT_TIMEOUT_S = 60
 
 
 class VideoError(Exception):
@@ -76,6 +86,10 @@ class DownloadResult:
     height: int | None = None
     thumbnail: str | None = None
     notice: str | None = None
+    extractor: str | None = None
+    video_id: str | None = None
+    # "attachment" | "recompress" | "host"
+    mode: str | None = None
 
 
 def _host_allowed(host: str) -> bool:
@@ -136,17 +150,6 @@ def _build_format(height: int | None = None) -> str:
     )
 
 
-def _build_small_format(max_bytes: int) -> str:
-    """Formato que ya debería caber en max_bytes (evita recomprimir)."""
-    return (
-        f"bv*[height<=480][filesize_approx<{max_bytes}]+ba"
-        f"/b[height<=480][filesize_approx<{max_bytes}]"
-        f"/bv*[height<=480]+ba"
-        f"/b[height<=480]"
-        f"/b"
-    )
-
-
 def _build_short_side_format(short_side: int) -> str:
     """Formato limitado por el lado corto (para verticales de Instagram)."""
     return (
@@ -170,6 +173,173 @@ def _estimate_size(fmt: dict, duration: float | None) -> int | None:
     if isinstance(tbr, (int, float)) and tbr > 0 and duration and duration > 0:
         return int(tbr * duration * 125)
     return None
+
+
+@dataclass
+class _Candidate:
+    """Candidato de descarga: IDs exactos y tamaño estimado."""
+
+    video_id: str
+    audio_id: str | None
+    height: int
+    est_size: int
+    label: str
+
+    @property
+    def format_spec(self) -> str:
+        if self.audio_id:
+            return f"{self.video_id}+{self.audio_id}"
+        return self.video_id
+
+
+def _is_mp4_video(fmt: dict) -> bool:
+    """Video mp4 (avc1) con altura conocida."""
+    if fmt.get("vcodec") in (None, "none"):
+        return False
+    if not str(fmt.get("vcodec", "")).startswith("avc1"):
+        return False
+    ext = (fmt.get("ext") or "").lower()
+    if ext and ext != "mp4":
+        return False
+    return isinstance(fmt.get("height"), int) and fmt["height"] > 0
+
+
+def _is_m4a_audio(fmt: dict) -> bool:
+    """Audio m4a (mp4a) sin video."""
+    if fmt.get("acodec") in (None, "none"):
+        return False
+    if fmt.get("vcodec") not in (None, "none"):
+        return False
+    ext = (fmt.get("ext") or "").lower()
+    return ext in ("m4a", "mp4")
+
+
+def _is_single_mp4(fmt: dict) -> bool:
+    """Formato único mp4 con video y audio."""
+    if fmt.get("vcodec") in (None, "none"):
+        return False
+    if fmt.get("acodec") in (None, "none"):
+        return False
+    ext = (fmt.get("ext") or "").lower()
+    if ext and ext != "mp4":
+        return False
+    return isinstance(fmt.get("height"), int) and fmt["height"] > 0
+
+
+def _build_candidates(
+    info: dict, duration: float | None, limit_bytes: int
+) -> list[_Candidate]:
+    """Construye candidatos de mayor a menor calidad (altura <= MAX_VIDEO_HEIGHT).
+
+    Para cada altura: primero el mejor audio m4a, luego el de menor bitrate.
+    Devuelve la lista ordenada por altura descendente (sin filtrar por tamaño).
+    """
+    formats = info.get("formats") or []
+    max_height = settings.max_video_height
+
+    videos = [
+        f
+        for f in formats
+        if _is_mp4_video(f) and f["height"] <= max_height and f.get("format_id")
+    ]
+    audios = [f for f in formats if _is_m4a_audio(f) and f.get("format_id")]
+    singles = [
+        f
+        for f in formats
+        if _is_single_mp4(f) and f["height"] <= max_height and f.get("format_id")
+    ]
+
+    # Audio: mejor (mayor abr) y menor (menor abr).
+    def _abr(f: dict) -> float:
+        v = f.get("abr")
+        return float(v) if isinstance(v, (int, float)) and v > 0 else 0.0
+
+    best_audio = max(audios, key=_abr) if audios else None
+    worst_audio = min(audios, key=_abr) if audios else None
+
+    # Agrupar videos por altura; dentro de cada altura, el de mayor tbr.
+    by_height: dict[int, list[dict]] = {}
+    for f in videos:
+        by_height.setdefault(int(f["height"]), []).append(f)
+
+    candidates: list[_Candidate] = []
+    for height in sorted(by_height.keys(), reverse=True):
+        group = sorted(
+            by_height[height],
+            key=lambda f: float(f.get("tbr") or 0),
+            reverse=True,
+        )
+        video = group[0]
+        v_size = _estimate_size(video, duration)
+        if v_size is None:
+            continue
+        # 1) mejor audio m4a
+        if best_audio is not None:
+            a_size = _estimate_size(best_audio, duration) or 0
+            total = int((v_size + a_size) * _SIZE_MARGIN)
+            candidates.append(
+                _Candidate(
+                    video_id=video["format_id"],
+                    audio_id=best_audio["format_id"],
+                    height=height,
+                    est_size=total,
+                    label=f"{height}p+audio_best",
+                )
+            )
+        # 2) audio de menor bitrate (si es distinto)
+        if worst_audio is not None and (
+            best_audio is None
+            or worst_audio["format_id"] != best_audio["format_id"]
+        ):
+            a_size = _estimate_size(worst_audio, duration) or 0
+            total = int((v_size + a_size) * _SIZE_MARGIN)
+            candidates.append(
+                _Candidate(
+                    video_id=video["format_id"],
+                    audio_id=worst_audio["format_id"],
+                    height=height,
+                    est_size=total,
+                    label=f"{height}p+audio_min",
+                )
+            )
+        # 3) video sin audio (por si no hay pista m4a)
+        if best_audio is None:
+            candidates.append(
+                _Candidate(
+                    video_id=video["format_id"],
+                    audio_id=None,
+                    height=height,
+                    est_size=int(v_size * _SIZE_MARGIN),
+                    label=f"{height}p+no_audio",
+                )
+            )
+
+    # Formatos únicos mp4 (con audio) como respaldo.
+    for f in sorted(singles, key=lambda x: int(x["height"]), reverse=True):
+        size = _estimate_size(f, duration)
+        if size is None:
+            continue
+        candidates.append(
+            _Candidate(
+                video_id=f["format_id"],
+                audio_id=None,
+                height=int(f["height"]),
+                est_size=int(size * _SIZE_MARGIN),
+                label=f"{int(f['height'])}p+single",
+            )
+        )
+
+    # Orden final: por altura descendente, luego por tamaño ascendente.
+    candidates.sort(key=lambda c: (-c.height, c.est_size))
+    logger.info(
+        "Candidatos considerados (LIM=%d bytes): %s",
+        limit_bytes,
+        ", ".join(
+            f"{c.label}={c.est_size / (1024 * 1024):.1f}MB" for c in candidates
+        )
+        or "(ninguno)",
+    )
+    return candidates
 
 
 def _pick_host_formats(
@@ -345,6 +515,54 @@ def _pick_instagram_short_side(
     return chosen, audio, _short_side(chosen) or 0, chosen_size
 
 
+async def _extract_info_cli(url: str, work_dir: Path) -> dict:
+    """Extrae la info con `yt-dlp -J --no-playlist` (CLI, matable).
+
+    Guarda el JSON en work_dir/info.json y devuelve el dict.
+    """
+    info_path = work_dir / "info.json"
+    args = [
+        "-J",
+        "--no-playlist",
+        "--no-warnings",
+        "--skip-download",
+        "-o",
+        str(info_path),
+        url,
+    ]
+    try:
+        result = await run_ytdlp(args, timeout=_EXTRACT_TIMEOUT_S)
+    except ProcTimeout as exc:
+        raise VideoNetworkError(
+            "El origen del video tardó demasiado en responder; intenta de nuevo."
+        ) from exc
+    except ProcError as exc:
+        raise VideoUnavailableError(
+            "No se pudo leer la información del video."
+        ) from exc
+    if result.returncode != 0:
+        # yt-dlp escribe el error en stderr; se traduce con el mapeador.
+        raise _map_ytdlp_error(
+            yt_dlp.utils.DownloadError(result.stderr or "yt-dlp falló"), url
+        )
+    raw = (result.stdout or "").strip()
+    if not raw:
+        raise VideoUnavailableError("No se pudo leer la información del video.")
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise VideoUnavailableError(
+            "La información del video no es válida."
+        ) from exc
+    if not isinstance(info, dict):
+        raise VideoUnavailableError("No se pudo leer la información del video.")
+    try:
+        info_path.write_text(raw, encoding="utf-8")
+    except OSError as exc:
+        logger.debug("No se pudo guardar info.json: %s", exc)
+    return info
+
+
 async def _probe_duration(path: Path) -> float | None:
     """Mide la duración del archivo con ffprobe; None si no se puede."""
     if shutil.which("ffprobe") is None:
@@ -410,47 +628,70 @@ def _notify(
         logger.debug("No se pudo programar el estado: %s", text)
 
 
+async def _download_with_format(
+    url: str,
+    out_path: Path,
+    format_spec: str,
+    max_filesize: int | None = None,
+    extra_args: list[str] | None = None,
+) -> Path | None:
+    """Descarga con IDs exactos vía CLI. Devuelve la ruta o None si no cabe."""
+    args = [
+        "-f",
+        format_spec,
+        "--merge-output-format",
+        "mp4",
+        "--no-playlist",
+        "--no-warnings",
+        "--concurrent-fragments",
+        "8",
+        "-o",
+        str(out_path.with_suffix(".%(ext)s")),
+    ]
+    if max_filesize is not None:
+        args += ["--max-filesize", str(max_filesize)]
+    if extra_args:
+        args += extra_args
+    args.append(url)
+
+    try:
+        result = await run_ytdlp(args, timeout=None)
+    except ProcError as exc:
+        raise VideoNetworkError(
+            "Fallo de red al descargar el video."
+        ) from exc
+    if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        if "max-filesize" in stderr or "file is larger than max" in stderr:
+            logger.info(
+                "Descarga abortada por --max-filesize (%d bytes)", max_filesize or 0
+            )
+            return None
+        raise _map_ytdlp_error(
+            yt_dlp.utils.DownloadError(result.stderr or "yt-dlp falló"), url
+        )
+
+    candidates = list(out_path.parent.glob(f"{out_path.stem}.*"))
+    if not candidates:
+        return None
+    return candidates[0]
+
+
 async def _download_sync(
     url: str,
     out_path: Path,
     max_bytes: int | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
-) -> tuple[Path, str, float | None, int, str | None, str | None]:
-    """Descarga el video (async).
+) -> tuple[Path, str, float | None, int, str | None, str | None, str | None, str | None, str]:
+    """Descarga el video con escalones de formato (Fase 2).
 
-    TODO(Fase 2): yt_dlp.YoutubeDL usa la API Python y corre en un hilo que
-    no se puede matar. Migrar a CLI (yt-dlp -J + --load-info-json) para que
-    el timeout de la cola pueda matar el árbol de procesos.
-
-    Devuelve (ruta, título, duración, altura_usada, thumbnail, aviso).
+    Devuelve (ruta, título, duración, altura, thumbnail, aviso, extractor,
+    video_id, mode). mode ∈ {"attachment", "recompress", "host"}.
     """
     _notify(loop, on_status, "Obteniendo información del video...")
-    ydl_opts = {
-        "format": _build_format(),
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "outtmpl": str(out_path.with_suffix(".%(ext)s")),
-        "quiet": True,
-        "no_warnings": True,
-        "concurrent_fragment_downloads": 8,
-        "logger": _YdlLogger(),
-    }
-
-    host = (urlparse(url).hostname or "").lower()
-    if host == "tiktok.com" or host.endswith(".tiktok.com"):
-        if _IMPERSONATE_AVAILABLE and ImpersonateTarget is not None:
-            ydl_opts["impersonate"] = ImpersonateTarget("chrome")
-            logger.info("TikTok: usando impersonate=chrome (curl_cffi)")
-        else:
-            logger.warning("TikTok puede fallar sin curl_cffi")
-
-    # 1) Comprobar duración antes de descargar.
-    # TODO(Fase 2): migrar a `yt-dlp -J --no-playlist URL` (CLI) para poder
-    # matar el proceso en timeout. Hoy corre en un hilo no interrumpible.
-    info = await asyncio.to_thread(_extract_info_sync, url, ydl_opts)
-    if not isinstance(info, dict):
-        raise VideoUnavailableError("No se pudo leer la información del video.")
+    work_dir = out_path.parent
+    info = await _extract_info_cli(url, work_dir)
 
     # Carrusel de Instagram: tomar solo la primera entrada.
     notice: str | None = None
@@ -463,7 +704,10 @@ async def _download_sync(
                     f"El enlace contiene {len(entries)} elementos; "
                     "se descarga solo el primero."
                 )
-                logger.info("Carrusel detectado (%d entradas); se usa la primera.", len(entries))
+                logger.info(
+                    "Carrusel detectado (%d entradas); se usa la primera.",
+                    len(entries),
+                )
             info = entries[0]
 
     duration = info.get("duration")
@@ -471,6 +715,8 @@ async def _download_sync(
         duration = None
     title = _pick_title(info, out_path.stem)
     thumbnail = _normalize_thumbnail(info.get("thumbnail"))
+    extractor = info.get("extractor_key") or info.get("extractor")
+    video_id = info.get("id")
     if duration is not None and duration > settings.max_video_minutes * 60:
         raise VideoTooLongError(
             f"El video dura más de {settings.max_video_minutes} minutos."
@@ -484,41 +730,16 @@ async def _download_sync(
         and duration > settings.instagram_long_reel_seconds
     )
     logger.info(
-        "Dominio=%s duración=%s instagram=%s long_reel=%s",
+        "Extracción: extractor=%s id=%s dominio=%s duración=%s instagram=%s long_reel=%s",
+        extractor,
+        video_id,
         urlparse(url).hostname,
         f"{duration:.1f}s" if duration is not None else "desconocida",
         is_instagram,
         is_long_instagram,
     )
 
-    # 2) Intentar un formato que ya quepa en max_bytes (evita recomprimir).
-    # TODO(Fase 2): migrar a CLI para poder matar el proceso en timeout.
-    if max_bytes:
-        small_opts = {**ydl_opts, "format": _build_small_format(max_bytes)}
-        try:
-            await asyncio.to_thread(_download_sync_ytdlp, url, small_opts)
-            candidates = list(out_path.parent.glob(f"{out_path.stem}.*"))
-            if candidates and candidates[0].stat().st_size <= max_bytes:
-                logger.info(
-                    "Descarga con formato pre-ajustado (<= %d bytes, altura<=480p)",
-                    max_bytes,
-                )
-                return candidates[0], title, duration, 480, thumbnail, notice
-            for c in candidates:
-                c.unlink(missing_ok=True)
-        except yt_dlp.utils.DownloadError:
-            logger.info("No hay formato pre-ajustado; se usa el flujo normal.")
-
-    # 3) Elegir altura según destino: si va a host externo (duración > límite de
-    #    recompresión), usar HOST_VIDEO_HEIGHT con tope HOST_MAX_MB; si no,
-    #    MAX_VIDEO_HEIGHT. Los reels largos de Instagram se limitan a 480p
-    #    (lado corto) para intentar que quepan como adjunto sin recomprimir.
-    duration_min = (duration or 0) / 60
-    if duration is None:
-        logger.warning(
-            "Duración desconocida; se saltan las reglas por duración y se usa "
-            "el flujo de adjunto (recompresión permitida si no cabe)."
-        )
+    # Instagram reel largo: flujo dedicado (lado corto <= 480).
     if is_long_instagram:
         picked_ig = _pick_instagram_short_side(info, duration, max_bytes or 0)
         if picked_ig is not None:
@@ -538,110 +759,201 @@ async def _download_sync(
         else:
             height = 480
             logger.info(
-                "Instagram reel largo sin formatos con lado corto; se usa %dp", height
+                "Instagram reel largo sin formatos con lado corto; se usa %dp",
+                height,
             )
             fmt = _build_short_side_format(height)
-    elif duration is not None and duration_min > settings.recompress_max_minutes:
-        host_max_bytes = settings.host_max_mb * 1024 * 1024
-        picked = _pick_host_formats(info, duration, host_max_bytes)
-        if picked is None:
-            height = settings.host_video_height
-            logger.info(
-                "Altura elegida: %dp (destino host externo, sin formatos; duración %.1f min)",
-                height,
-                duration_min,
-            )
-            fmt = _build_format(height)
-        else:
-            video_fmt, audio_fmt, height, est_size = picked
-            logger.info(
-                "Altura elegida: %dp (destino host externo, duración %.1f min, "
-                "tamaño estimado ~%d bytes)",
-                height,
-                duration_min,
-                est_size,
-            )
-            if audio_fmt is not None:
-                fmt = f"{video_fmt['format_id']}+{audio_fmt['format_id']}"
-            else:
-                fmt = video_fmt["format_id"]
-    else:
-        height = settings.max_video_height
+        _notify(loop, on_status, f"Descargando video ({height}p)...")
+        final_path = await _download_with_format(url, out_path, fmt)
+        if final_path is None:
+            raise VideoUnavailableError("No se pudo descargar el video.")
+        if duration is None:
+            probed = await _probe_duration(final_path)
+            if probed is not None:
+                duration = probed
         logger.info(
-            "Altura elegida: %dp (destino adjunto, duración %.1f min)",
+            "Tamaño real final: %d bytes (lado corto %dp, dominio=%s, duración=%s)",
+            final_path.stat().st_size,
             height,
-            duration_min,
+            urlparse(url).hostname,
+            f"{duration:.1f}s" if duration is not None else "desconocida",
         )
-        fmt = _build_format(height)
+        return (
+            final_path,
+            title,
+            duration,
+            height,
+            thumbnail,
+            notice,
+            extractor,
+            video_id,
+            "attachment",
+        )
 
-    # 4) Descargar con el formato elegido (contenedor mp4).
-    # TODO(Fase 2): migrar a CLI para poder matar el proceso en timeout.
-    _notify(loop, on_status, f"Descargando video ({height}p)...")
-    await asyncio.to_thread(_download_sync_ytdlp, url, {**ydl_opts, "format": fmt})
+    # Escalones de formato: elegir ANTES de descargar.
+    limit_bytes = max_bytes or (settings.upload_limit_mb * 1024 * 1024)
+    candidates = _build_candidates(info, duration, limit_bytes)
 
-    # 5) Localizar el archivo final (la extensión puede variar tras el merge).
-    candidates = list(out_path.parent.glob(f"{out_path.stem}.*"))
-    if not candidates:
+    chosen: _Candidate | None = None
+    for cand in candidates:
+        if cand.est_size <= limit_bytes:
+            chosen = cand
+            logger.info(
+                "Candidato elegido: %s (estimado %.1f MB <= LIM %.1f MB)",
+                cand.label,
+                cand.est_size / (1024 * 1024),
+                limit_bytes / (1024 * 1024),
+            )
+            break
+        logger.info(
+            "Candidato descartado: %s (estimado %.1f MB > LIM %.1f MB)",
+            cand.label,
+            cand.est_size / (1024 * 1024),
+            limit_bytes / (1024 * 1024),
+        )
+
+    # Descargar el elegido; si el tamaño real excede LIM, probar el siguiente.
+    if chosen is not None:
+        idx = candidates.index(chosen)
+        for cand in candidates[idx:]:
+            _notify(loop, on_status, f"Descargando video ({cand.height}p)...")
+            final_path = await _download_with_format(
+                url, out_path, cand.format_spec, max_filesize=limit_bytes
+            )
+            if final_path is None:
+                logger.info(
+                    "Descarte por --max-filesize: %s", cand.label
+                )
+                continue
+            real = final_path.stat().st_size
+            if real > limit_bytes:
+                logger.info(
+                    "Descarte por tamaño real: %s (%.1f MB > LIM %.1f MB)",
+                    cand.label,
+                    real / (1024 * 1024),
+                    limit_bytes / (1024 * 1024),
+                )
+                final_path.unlink(missing_ok=True)
+                continue
+            logger.info(
+                "Descarga OK: %s, real %.1f MB (LIM %.1f MB)",
+                cand.label,
+                real / (1024 * 1024),
+                limit_bytes / (1024 * 1024),
+            )
+            if duration is None:
+                probed = await _probe_duration(final_path)
+                if probed is not None:
+                    duration = probed
+            return (
+                final_path,
+                title,
+                duration,
+                cand.height,
+                thumbnail,
+                notice,
+                extractor,
+                video_id,
+                "attachment",
+            )
+
+    # Ningún candidato cabe: decidir recompresión vs host.
+    smallest = min(candidates, key=lambda c: c.est_size) if candidates else None
+    duration_known = duration is not None and duration > 0
+    duration_min = (duration or 0) / 60
+    recompress_allowed = (
+        settings.recompress_enabled
+        and settings.recompress_max_minutes > 0
+        and duration_known
+        and duration_min <= settings.recompress_max_minutes
+    )
+    kbps = 0
+    if duration_known and duration and duration > 0:
+        kbps = int((limit_bytes * 8 / 1000 / duration) - _RECOMPRESS_AUDIO_KBPS)
+    can_recompress = (
+        recompress_allowed
+        and smallest is not None
+        and kbps >= _RECOMPRESS_MIN_VIDEO_KBPS
+    )
+
+    if can_recompress and smallest is not None:
+        source_mb = smallest.est_size / (1024 * 1024)
+        max_source_mb = settings.recompress_max_source_mb
+        if max_source_mb > 0 and source_mb > max_source_mb:
+            logger.info(
+                "Recompresión descartada: candidato más pequeño %.1f MB > "
+                "RECOMPRESS_MAX_SOURCE_MB=%d",
+                source_mb,
+                max_source_mb,
+            )
+            can_recompress = False
+        else:
+            logger.info(
+                "Recompresión elegida: candidato %s (%.1f MB), kbps=%d",
+                smallest.label,
+                source_mb,
+                kbps,
+            )
+
+    if can_recompress and smallest is not None:
+        _notify(loop, on_status, f"Descargando video ({smallest.height}p)...")
+        final_path = await _download_with_format(
+            url, out_path, smallest.format_spec, max_filesize=None
+        )
+        if final_path is None:
+            raise VideoUnavailableError("No se pudo descargar el video.")
+        if duration is None:
+            probed = await _probe_duration(final_path)
+            if probed is not None:
+                duration = probed
+        logger.info(
+            "Descarga para recompresión OK: %s, real %.1f MB",
+            smallest.label,
+            final_path.stat().st_size / (1024 * 1024),
+        )
+        return (
+            final_path,
+            title,
+            duration,
+            smallest.height,
+            thumbnail,
+            notice,
+            extractor,
+            video_id,
+            "recompress",
+        )
+
+    # Host externo: descargar a HOST_VIDEO_HEIGHT (nunca 720p).
+    host_height = settings.host_video_height
+    logger.info(
+        "Ningún candidato cabe y no se recompone; se descarga a %dp para host externo",
+        host_height,
+    )
+    _notify(loop, on_status, f"Descargando video ({host_height}p)...")
+    fmt = _build_format(host_height)
+    final_path = await _download_with_format(url, out_path, fmt)
+    if final_path is None:
         raise VideoUnavailableError("No se pudo descargar el video.")
-    final_path = candidates[0]
     if duration is None:
         probed = await _probe_duration(final_path)
         if probed is not None:
             duration = probed
-            logger.info("Duración medida con ffprobe: %.1fs", duration)
-        else:
-            logger.warning(
-                "No se pudo medir la duración del archivo; se deja como desconocida."
-            )
     logger.info(
-        "Tamaño real final: %d bytes (lado corto %dp, dominio=%s, duración=%s)",
-        final_path.stat().st_size,
-        height,
-        urlparse(url).hostname,
-        f"{duration:.1f}s" if duration is not None else "desconocida",
+        "Descarga para host OK: %dp, real %.1f MB",
+        host_height,
+        final_path.stat().st_size / (1024 * 1024),
     )
-    if max_bytes:
-        logger.info(
-            "Descargado: %.1f MB (límite de adjunto: %.1f MB)",
-            final_path.stat().st_size / (1024 * 1024),
-            max_bytes / (1024 * 1024),
-        )
-    return final_path, title, duration, height, thumbnail, notice
-
-
-def _extract_info_sync(url: str, ydl_opts: dict) -> dict | None:
-    """Extrae info con la API Python de yt-dlp (hilo no interrumpible).
-
-    TODO(Fase 2): reemplazar por `yt-dlp -J --no-playlist URL` (CLI).
-    """
-    with yt_dlp.YoutubeDL({**ydl_opts, "skip_download": True}) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
-def _download_sync_ytdlp(url: str, ydl_opts: dict) -> None:
-    """Descarga con la API Python de yt-dlp (hilo no interrumpible).
-
-    TODO(Fase 2): reemplazar por CLI para poder matar el árbol en timeout.
-    """
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-
-
-class _YdlLogger:
-    """Redirige los logs de yt-dlp a logging, sin filtrar secretos."""
-
-    def debug(self, msg: str) -> None:
-        if not msg.startswith("[debug] "):
-            logger.debug(msg)
-
-    def info(self, msg: str) -> None:
-        logger.debug(msg)
-
-    def warning(self, msg: str) -> None:
-        logger.warning(msg)
-
-    def error(self, msg: str) -> None:
-        logger.error(msg)
+    return (
+        final_path,
+        title,
+        duration,
+        host_height,
+        thumbnail,
+        notice,
+        extractor,
+        video_id,
+        "host",
+    )
 
 
 def _map_ytdlp_error(
@@ -728,14 +1040,24 @@ async def download_video(
     loop = asyncio.get_running_loop()
     # La concurrencia la controla services/video_queue.py (Fase 1).
     try:
-        path, title, duration, height, thumbnail, notice = await _download_sync(
-            url, out_path, max_bytes, loop, on_status
-        )
+        (
+            path,
+            title,
+            duration,
+            height,
+            thumbnail,
+            notice,
+            extractor,
+            video_id,
+            mode,
+        ) = await _download_sync(url, out_path, max_bytes, loop, on_status)
     except VideoError:
         raise
     except yt_dlp.utils.DownloadError as exc:
         raise _map_ytdlp_error(exc, url) from exc
-    logger.info("Descarga completada en %.2f s", time.perf_counter() - start)
+    logger.info(
+        "Descarga completada en %.2f s (mode=%s)", time.perf_counter() - start, mode
+    )
 
     size = path.stat().st_size
     return DownloadResult(
@@ -747,6 +1069,9 @@ async def download_video(
         height=height,
         thumbnail=thumbnail,
         notice=notice,
+        extractor=extractor,
+        video_id=video_id,
+        mode=mode,
     )
 
 
@@ -1026,6 +1351,9 @@ async def recompress_video(
         size=dst.stat().st_size,
         height=result.height,
         thumbnail=result.thumbnail,
+        extractor=result.extractor,
+        video_id=result.video_id,
+        mode="recompress",
     )
 
 
