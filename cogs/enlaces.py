@@ -7,11 +7,11 @@ import unicodedata
 import discord
 from discord.ext import commands
 
-from cogs.chat import Chat
 from cogs.video import MessageResponder, check_cooldown, run_video_flow
 from config import settings
 from media.downloader import _host_allowed
 from utils.errors import UNEXPECTED_ERROR_MESSAGE, new_error_ref, report_error
+from utils.menciones import clasificar_mencion
 from utils.mensajes_store import store as mensajes_store
 from utils.permisos import es_admin
 
@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 
-# Frases de activar/desactivar mensajes (sin acentos, minúsculas).
-_ACTIVAR_PHRASES = ("activa mensajes", "enciende mensajes")
-_DESACTIVAR_PHRASES = ("desactiva mensajes", "apaga mensajes")
+# Verbos de activar/desactivar mensajes (sin acentos, minúsculas).
+_ACTIVAR_VERBS = ("activa", "activar", "enciende")
+_DESACTIVAR_VERBS = ("desactiva", "desactivar", "apaga")
 
 
 def _normalize(text: str) -> str:
@@ -33,11 +33,11 @@ def _normalize(text: str) -> str:
 def _detect_toggle(text: str) -> bool | None:
     """Devuelve True (activar), False (desactivar) o None si no aplica."""
     norm = _normalize(text)
-    for phrase in _ACTIVAR_PHRASES:
-        if phrase in norm:
+    for verb in _ACTIVAR_VERBS:
+        if norm.startswith(verb):
             return True
-    for phrase in _DESACTIVAR_PHRASES:
-        if phrase in norm:
+    for verb in _DESACTIVAR_VERBS:
+        if norm.startswith(verb):
             return False
     return None
 
@@ -122,30 +122,24 @@ class Enlaces(commands.Cog):
 
         # --- Enrutado en modo mención -----------------------------------
         if mentioned:
-            urls = _extract_urls(message.content)
-            if urls:
-                url = _extract_video_url(message.content)
-                if url is None:
-                    logger.info(
-                        "Mención con URL no soportada (usuario=%s canal=%s urls=%s)",
-                        message.author.id,
-                        message.channel.id,
-                        urls,
-                    )
-                    await message.reply(
-                        "Ese enlace no está soportado.",
-                        mention_author=False,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    return
-                logger.info(
-                    "Mención -> ruta=descarga (usuario=%s canal=%s url=%s)",
-                    message.author.id,
-                    message.channel.id,
-                    url,
+            ruta = clasificar_mencion(message, self.bot.user)
+            logger.info(
+                "Mención (enlaces) usuario=%s canal=%s ruta=%s",
+                message.author.id,
+                message.channel.id,
+                ruta,
+            )
+            if ruta == "chat":
+                # El cog Chat se encarga de esta mención.
+                return
+            if ruta == "vacia":
+                await message.reply(
+                    "Mencióname con un enlace de YouTube o Instagram",
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
-            else:
-                # Sin URLs: probar frases de activar/desactivar mensajes.
+                return
+            if ruta == "toggle_mensajes":
                 text_only = message.content
                 if self.bot.user is not None:
                     for mention in (
@@ -153,36 +147,34 @@ class Enlaces(commands.Cog):
                         f"<@!{self.bot.user.id}>",
                     ):
                         text_only = text_only.replace(mention, " ")
-                toggle = _detect_toggle(text_only)
-                if toggle is not None:
-                    await self._handle_toggle(message, toggle)
+                toggle = _detect_toggle(text_only.strip())
+                if toggle is None:
+                    # No debería ocurrir; cae al chat como salvaguarda.
                     return
-                if not text_only.strip():
-                    logger.info(
-                        "Mención vacía (usuario=%s canal=%s)",
-                        message.author.id,
-                        message.channel.id,
-                    )
-                    await message.reply(
-                        "Mencióname con un enlace de YouTube o Instagram",
-                        mention_author=False,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    return
+                await self._handle_toggle(message, toggle)
+                return
+            # ruta == "descarga"
+            url = _extract_video_url(message.content)
+            if url is None:
+                urls = _extract_urls(message.content)
                 logger.info(
-                    "Mención -> ruta=chat (usuario=%s canal=%s)",
+                    "Mención con URL no soportada (usuario=%s canal=%s urls=%s)",
                     message.author.id,
                     message.channel.id,
+                    urls,
                 )
-                chat_cog = self.bot.get_cog("Chat")
-                if isinstance(chat_cog, Chat):
-                    await chat_cog.handle_mention(message)
-                else:
-                    logger.warning(
-                        "Cog Chat no disponible para mención (usuario=%s)",
-                        message.author.id,
-                    )
+                await message.reply(
+                    "Ese enlace no está soportado.",
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 return
+            logger.info(
+                "Mención -> ruta=descarga (usuario=%s canal=%s url=%s)",
+                message.author.id,
+                message.channel.id,
+                url,
+            )
 
         # --- Modo automático (canal) ------------------------------------
         url = _extract_video_url(message.content)

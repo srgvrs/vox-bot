@@ -17,6 +17,7 @@ from config import settings
 from media.downloader import _host_allowed
 from utils.chat_store import store
 from utils.errors import UNEXPECTED_ERROR_MESSAGE, new_error_ref, report_error
+from utils.menciones import clasificar_mencion
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +217,15 @@ class Chat(commands.Cog):
             return
         if self.bot.user is None or self.bot.user not in message.mentions:
             return
-        if _has_video_url(message.content):
+
+        ruta = clasificar_mencion(message, self.bot.user)
+        logger.info(
+            "Mención (chat) usuario=%s canal=%s ruta=%s",
+            message.author.id,
+            message.channel.id,
+            ruta,
+        )
+        if ruta != "chat":
             return
 
         text = message.content
