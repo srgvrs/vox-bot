@@ -103,3 +103,4 @@ vox-bot/
 - No se agregan dependencias nuevas sin justificarlas.
 
 ## Licencia
+[MIT LICENSE](https://github.com/srgvrs/vox-bot?tab=MIT-1-ov-file)
